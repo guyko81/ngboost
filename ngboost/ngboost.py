@@ -8,7 +8,9 @@ from ngboost.scores import MLE, CRPS
 from ngboost.learners import default_tree_learner, default_linear_learner
 from ngboost.distns.normal import Normal
 
-
+from scipy.optimize import minimize
+from scipy.optimize import Bounds
+ 
 class NGBoost(object):
 
     def __init__(self, Dist=Normal, Score=MLE(),
@@ -65,8 +67,27 @@ class NGBoost(object):
             scale = scale * 0.5
         self.scalings.append(scale)
         return scale
+    """
+    def line_search(self, resids, start, Y, scale_init=1):
+        S = self.Score
+        D_init = self.Dist(start.T)
+        loss_init = S.loss(D_init, Y)
+        n_params = start.shape[1]
+        scale = np.ones(n_params) * scale_init
 
-    def fit(self, X, Y, X_val = None, Y_val = None):
+        def loss_func(scale):
+            scaled_resids = resids * scale
+            D = self.Dist((start - scaled_resids).T)
+            loss = S.loss(D, Y)
+            return loss
+        bounds = Bounds([0.0, 1.0], [0.0, 1.0])
+        res = minimize(loss_func, scale, method='SLSQP', options={'xtol': 1e-8, 'disp': False}, bounds=bounds)
+        
+        scale=res.x
+        print(scale)
+        return scale
+    """
+    def fit(self, X, Y, new=True, X_val = None, Y_val = None):
 
         loss_list = []
         val_loss_list = []
@@ -84,7 +105,7 @@ class NGBoost(object):
 
             loss_list += [S.loss(D, Y_batch)]
             loss = loss_list[-1]
-            grads = S.natural_grad(D, Y_batch)
+            grads = S.natural_grad(D, Y_batch, new)
 
             proj_grad = self.fit_base(X_batch, grads)
             scale = self.line_search(proj_grad, P_batch, Y_batch)

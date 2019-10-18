@@ -7,9 +7,9 @@ class MLE:
     def loss(self, forecast, Y):
         return forecast.nll(Y.squeeze()).mean()
 
-    def natural_grad(self, forecast, Y):
+    def natural_grad(self, forecast, Y, new):
         fisher = forecast.fisher_info()
-        grad = forecast.D_nll(Y)
+        grad = forecast.D_nll(Y, new)
         nat_grad = np.linalg.solve(fisher, grad)
         return nat_grad
 

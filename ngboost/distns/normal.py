@@ -22,11 +22,14 @@ class Normal(object):
     def nll(self, Y):
         return -self.dist.logpdf(Y).mean()
 
-    def D_nll(self, Y_):
+    def D_nll(self, Y_, new=True):
         Y = Y_.squeeze()
         D = np.zeros((self.var.shape[0], 2))
         D[:, 0] = (self.loc - Y) / self.var
-        D[:, 1] = 1 - ((self.loc - Y) ** 2) / self.var
+        if new:
+            D[:, 1] = (1 - ((self.loc - Y) ** 2) / self.var)/self.scale
+        else:
+            D[:, 1] = 1 - ((self.loc - Y) ** 2) / self.var
         return D
 
     def crps(self, Y):

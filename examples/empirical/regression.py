@@ -29,7 +29,7 @@ dataset_name_to_loader = {
     "yacht": lambda: pd.read_csv("http://archive.ics.uci.edu/ml/machine-learning-databases/00243/yacht_hydrodynamics.data", header=None, delim_whitespace=True),
     "msd": lambda: pd.read_csv("data/uci/YearPredictionMSD.txt").iloc[:, ::-1],
 }
-
+"""
 base_name_to_learner = {
     "tree": default_tree_learner,
     "linear": default_linear_learner,
@@ -39,12 +39,20 @@ score_name_to_score = {
     "MLE": MLE,
     "CRPS": CRPS,
 }
+"""
+base_name_to_learner = {
+    "tree": default_tree_learner,
+}
+
+score_name_to_score = {
+    "MLE": MLE,
+}
 
 
 if __name__ == "__main__":
 
     argparser = ArgumentParser()
-    argparser.add_argument("--dataset", type=str, default="concrete")
+    argparser.add_argument("--dataset", type=str, default="energy")
     argparser.add_argument("--reps", type=int, default=5)
     argparser.add_argument("--n-est", type=int, default=2000)
     argparser.add_argument("--n-splits", type=int, default=20)
@@ -70,9 +78,9 @@ if __name__ == "__main__":
 
     print('== Dataset=%s X.shape=%s %s/%s' % (args.dataset, str(X.shape), args.score, args.distn))
 
-    y_gbm, y_ngb, y_true = [], [], []
-    gbm_rmse, ngb_rmse = [], []
-    ngb_nll = []
+    y_gbm, y_ngb, y_new_ngb, y_true = [], [], [], []
+    gbm_rmse, ngb_rmse, ngb_new_rmse = [], [], []
+    ngb_nll, ngb_new_nll = [], []
     
     if args.dataset == "msd":
         folds = [(np.arange(463715), np.arange(463715, len(X)))]
@@ -103,7 +111,58 @@ if __name__ == "__main__":
         X_train, X_val, y_train, y_val = train_test_split(X_trainall, y_trainall, test_size=0.2)
         
         y_true += list(y_test.flatten())
+        
+        #----------------------------------------------------------------------------
+        # Original method
+        #----------------------------------------------------------------------------
+        ngb = NGBoost(Base=base_name_to_learner[args.base],
+                      Dist=eval(args.distn),
+                      Score=score_name_to_score[args.score](64),
+                      n_estimators=args.n_est,
+                      learning_rate=args.lr,
+                      natural_gradient=args.natural,
+                      minibatch_frac=args.minibatch_frac,
+                      verbose=args.verbose)
 
+        train_loss, val_loss = ngb.fit(X_train, y_train, new=False) #, X_val, y_val)
+
+        y_preds = ngb.staged_predict(X_val)
+        y_forecasts = ngb.staged_pred_dist(X_val)
+        val_rmse = [mean_squared_error(y_pred, y_val) for y_pred in y_preds]
+        val_nll = [-y_forecast.logpdf(y_val.flatten()).mean() for y_forecast in y_forecasts]
+        best_itr = np.argmin(val_rmse) + 1
+        best_itr = np.argmin(val_nll) + 1
+
+        full_retrain = True
+        if full_retrain:
+            ngb = NGBoost(Base=base_name_to_learner[args.base],
+                      Dist=eval(args.distn),
+                      Score=score_name_to_score[args.score](64),
+                      n_estimators=args.n_est,
+                      learning_rate=args.lr,
+                      natural_gradient=args.natural,
+                      minibatch_frac=args.minibatch_frac,
+                      verbose=args.verbose)
+            ngb.fit(X_trainall, y_trainall, new=False)
+
+        forecast = ngb.pred_dist(X_test, max_iter=best_itr)
+
+        y_ngb += list(forecast.loc)
+        ngb_rmse += [np.sqrt(mean_squared_error(forecast.loc, y_test))]
+        ngb_nll += [-forecast.logpdf(y_test.flatten()).mean()]
+        
+        #print(np.sqrt(mean_squared_error(forecast.loc, y_test)))
+        #for idx, y_p, y_t in zip(test_index, list(forecast.loc), y_test):
+        #    print(idx, y_t, y_p, np.abs(y_p - y_t))
+
+        if args.verbose or True:
+            print("[%d/%d] BestIter=%d RMSE: Val=%.4f Test=%.4f NLL: Test=%.4f" % (itr+1, args.n_splits,
+                                                                                   best_itr, np.sqrt(val_rmse[best_itr-1]),
+                                                                                   np.sqrt(mean_squared_error(forecast.loc, y_test)),
+                                                                                   ngb_nll[-1]))
+        #----------------------------------------------------------------------------
+        # New method
+        #----------------------------------------------------------------------------
         ngb = NGBoost(Base=base_name_to_learner[args.base],
                       Dist=eval(args.distn),
                       Score=score_name_to_score[args.score](64),
@@ -136,9 +195,9 @@ if __name__ == "__main__":
 
         forecast = ngb.pred_dist(X_test, max_iter=best_itr)
 
-        y_ngb += list(forecast.loc)
-        ngb_rmse += [np.sqrt(mean_squared_error(forecast.loc, y_test))]
-        ngb_nll += [-forecast.logpdf(y_test.flatten()).mean()]
+        y_new_ngb += list(forecast.loc)
+        ngb_new_rmse += [np.sqrt(mean_squared_error(forecast.loc, y_test))]
+        ngb_new_nll += [-forecast.logpdf(y_test.flatten()).mean()]
         
         #print(np.sqrt(mean_squared_error(forecast.loc, y_test)))
         #for idx, y_p, y_t in zip(test_index, list(forecast.loc), y_test):
@@ -148,7 +207,8 @@ if __name__ == "__main__":
             print("[%d/%d] BestIter=%d RMSE: Val=%.4f Test=%.4f NLL: Test=%.4f" % (itr+1, args.n_splits,
                                                                                    best_itr, np.sqrt(val_rmse[best_itr-1]),
                                                                                    np.sqrt(mean_squared_error(forecast.loc, y_test)),
-                                                                                   ngb_nll[-1]))
+                                                                                   ngb_new_nll[-1]))
+
 
         #logger.tick(forecast, y_test)
 
@@ -168,11 +228,30 @@ if __name__ == "__main__":
                                              np.sqrt(mean_squared_error(y_pred.flatten(), y_test.flatten()))))
         #gbrlog.tick(forecast, y_test)
 
-    print('== RMSE GBM=%.4f +/- %.4f, NGB=%.4f +/- %.4f, NLL NGB=%.4f +/ %.4f' % (np.mean(gbm_rmse), np.std(gbm_rmse),
-                                                                                  np.mean(ngb_rmse), np.std(ngb_rmse),
-                                                                                  np.mean(ngb_nll), np.std(ngb_nll)))
+    print('== RMSE GBM=%.4f +/- %.4f, NGB=%.4f +/- %.4f, NLL NGB=%.4f +/ %.4f, NEW NGB=%.4f +/- %.4f, NLL NEW NGB=%.4f +/ %.4f' \
+          % (np.mean(gbm_rmse), np.std(gbm_rmse),
+            np.mean(ngb_rmse), np.std(ngb_rmse),
+            np.mean(ngb_nll), np.std(ngb_nll),
+            np.mean(ngb_new_rmse), np.std(ngb_new_rmse),
+            np.mean(ngb_new_nll), np.std(ngb_new_nll)))
 
-    logger.save()
-    gbrlog.save()
+    #logger.save()
+    #gbrlog.save()
 
 
+"""
+Concrete
+== RMSE GBM=4.6288 +/- 0.7065, 
+   NGB=5.4552 +/- 0.5278, NLL NGB=3.0689 +/ 0.1152, 
+   NEW NGB=4.4126 +/- 0.5412, NLL NEW NGB=2.8907 +/ 0.1202
+   
+Housing
+== RMSE GBM=2.9708 +/- 0.6025, 
+   NGB=2.9311 +/- 0.4371, NLL NGB=2.4586 +/ 0.1165, 
+   NEW NGB=2.6654 +/- 0.4139, NLL NEW NGB=2.4114 +/ 0.1156   
+   
+Wine
+== RMSE GBM=0.6183 +/- 0.0440, 
+   NGB=0.6344 +/- 0.0409, NLL NGB=0.9412 +/ 0.0729, 
+   NEW NGB=0.6478 +/- 0.0427, NLL NEW NGB=1.1721 +/ 0.8819
+"""
