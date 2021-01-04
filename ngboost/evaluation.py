@@ -1,8 +1,7 @@
 import numpy as np
-from tqdm import tqdm
-from lifelines import KaplanMeierFitter, NelsonAalenFitter
+from lifelines import KaplanMeierFitter
 from matplotlib import pyplot as plt
-from sklearn.metrics import roc_auc_score, r2_score, mean_squared_error
+from tqdm import tqdm
 
 
 def calibration_regression(Forecast, Y, bins=11, eps=1e-3):
@@ -18,7 +17,7 @@ def calibration_regression(Forecast, Y, bins=11, eps=1e-3):
     return pctles, observed, slope, intercept
 
 
-def calibration_time_to_event(Forecast, T, E, bins=10, eps=1e-3):
+def calibration_time_to_event(Forecast, T, E):
     """
     Calculate calibration in the time-to-event setting, with integral transform and KM.
     """
@@ -100,11 +99,10 @@ def calculate_concordance_naive(preds, Y, E):
     counter = 0
     for i in tqdm(range(N)):
         for j in range(i + 1, N):
-            if (
-                (E[i] and E[j])
-                or (E[i] and not E[j] and Y[i] < Y[j])
-                or (not E[i] and E[j] and Y[i] > Y[j])
-            ):
+            cond_1 = E[i] and E[j]
+            cond_2 = E[i] and not E[j] and Y[i] < Y[j]
+            cond_3 = not E[i] and E[j] and Y[i] > Y[j]
+            if cond_1 or cond_2 or cond_3:
                 if (preds[i] < preds[j] and trues[i] < trues[j]) or (
                     preds[i] > preds[j] and trues[i] > trues[j]
                 ):
