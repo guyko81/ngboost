@@ -1,3 +1,6 @@
+# Pycharm
+.idea/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -109,3 +112,4 @@ venv.bak/
 *.pkl
 
 .DS_Store
+poetry.lock
