@@ -11,4 +11,7 @@ from .ngboost import NGBoost
 
 __all__ = ["NGBClassifier", "NGBRegressor", "NGBSurvival", "NGBoost"]
 
-__version__ = version(__name__)
+try:
+    __version__ = version(__name__)
+except Exception:
+    __version__ = "dev"
