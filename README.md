@@ -1,10 +1,17 @@
 # NGBoost: Natural Gradient Boosting for Probabilistic Prediction
 
-![Python package](https://github.com/stanfordmlgroup/ngboost/workflows/Python%20package/badge.svg)
+<h4 align="center">
+
+![Python package](https://img.shields.io/pypi/v/ngboost)
+[![GitHub Repo Size](https://img.shields.io/github/repo-size/stanfordmlgroup/ngboost?label=Repo+Size)](https://github.com/stanfordmlgroup/ngboost/graphs/contributors)
 [![Github License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![PyPI](https://img.shields.io/pypi/v/ngboost?logo=pypi&logoColor=white)](https://pypi.org/project/ngboost)
+[![PyPI Downloads](https://img.shields.io/pypi/dm/ngboost?logo=icloud&logoColor=white)](https://pypistats.org/packages/ngboost)
 
-ngboost is a Python library that implements Natural Gradient Boosting, as described in ["NGBoost: Natural Gradient Boosting for Probabilistic Prediction"](https://stanfordmlgroup.github.io/projects/ngboost/). It is built on top of [Scikit-Learn](https://scikit-learn.org/stable/), and is designed to be scalable and modular with respect to choice of proper scoring rule, distribution, and base learner. A didactic introduction to the methodology underlying NGBoost is available in this [slide deck](https://drive.google.com/file/d/183BWFAdFms81MKy6hSku8qI97OwS_JH_/view?usp=sharing).
+</h4>
+
+ngboost is a Python library that implements Natural Gradient Boosting, as described in ["NGBoost: Natural Gradient Boosting for Probabilistic Prediction"](https://stanfordmlgroup.github.io/projects/ngboost/). It is built on top of [Scikit-Learn](https://scikit-learn.org/stable/), and is designed to be scalable and modular with respect to choice of proper scoring rule, distribution, and base learner. A didactic introduction to the methodology underlying NGBoost is available in this [slide deck](https://docs.google.com/presentation/d/1Tn23Su0ygR6z11jy3xVNiLGv0ggiUQue/edit?usp=share_link&ouid=102290675300480810195&rtpof=true&sd=true).
 
 ## Installation
 
@@ -25,11 +32,14 @@ Probabilistic regression example on the Boston housing dataset:
 ```python
 from ngboost import NGBRegressor
 
-from sklearn.datasets import load_boston
+from sklearn.datasets import fetch_california_housing
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 
-X, Y = load_boston(True)
+# Load California housing dataset
+cal = fetch_california_housing()
+X, Y = cal.data, cal.target
+
 X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2)
 
 ngb = NGBRegressor().fit(X_train, Y_train)

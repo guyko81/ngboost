@@ -1,14 +1,16 @@
 """The NGBoost library"""
+
 # pylint: disable=line-too-long,too-many-instance-attributes,too-many-arguments
 # pylint: disable=unused-argument,too-many-locals,too-many-branches,too-many-statements
 # pylint: disable=unused-variable,invalid-unary-operand-type,attribute-defined-outside-init
-# pylint: disable=redundant-keyword-arg,protected-access
+# pylint: disable=redundant-keyword-arg,protected-access,unnecessary-lambda-assignment
 import numpy as np
 from sklearn.base import clone
+from sklearn.model_selection import train_test_split
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.utils import check_array, check_random_state, check_X_y
 
-from ngboost.distns import Normal, k_categorical
+from ngboost.distns import MultivariateNormal, Normal, k_categorical
 from ngboost.learners import default_tree_learner
 from ngboost.manifold import manifold
 from ngboost.scores import LogScore
@@ -33,15 +35,24 @@ class NGBoost:
         n_estimators      : the number of boosting iterations to fit
         learning_rate     : the learning rate
         minibatch_frac    : the percent subsample of rows to use in each boosting iteration
+        col_sample        : the percent subsample of columns to use in each boosting iteration
         verbose           : flag indicating whether output should be printed during fitting
         verbose_eval      : increment (in boosting iterations) at which output should be printed
         tol               : numerical tolerance to be used in optimization
         random_state      : seed for reproducibility.
                             See https://stackoverflow.com/questions/28064634/random-state-pseudo-random-number-in-scikit-learn
+        validation_fraction: Proportion of training data to set aside as validation data for early stopping.
+        early_stopping_rounds: The number of consecutive boosting iterations during which the
+                                    loss has to increase before the algorithm stops early.
+                                    Set to None to disable early stopping and validation.
+                                    None enables running over the full data set.
+
+
     Output:
         An NGBRegressor object that can be fit.
     """
 
+    # pylint: disable=too-many-positional-arguments
     def __init__(
         self,
         Dist=Normal,
@@ -56,6 +67,8 @@ class NGBoost:
         verbose_eval=100,
         tol=1e-4,
         random_state=None,
+        validation_fraction=0.1,
+        early_stopping_rounds=None,
     ):
         self.Dist = Dist
         self.Score = Score
@@ -76,19 +89,34 @@ class NGBoost:
         self.tol = tol
         self.random_state = check_random_state(random_state)
         self.best_val_loss_itr = None
+        self.validation_fraction = validation_fraction
+        self.early_stopping_rounds = early_stopping_rounds
+
+        if hasattr(self.Dist, "multi_output"):
+            self.multi_output = self.Dist.multi_output
+        else:
+            self.multi_output = False
 
     def __getstate__(self):
         state = self.__dict__.copy()
         # Remove the unpicklable entries.
         del state["Manifold"]
+        state["Dist_name"] = self.Dist.__name__
         if self.Dist.__name__ == "Categorical":
             del state["Dist"]
             state["K"] = self.Dist.n_params + 1
+        elif self.Dist.__name__ == "MVN":
+            del state["Dist"]
+            state["K"] = (-3 + (9 + 8 * (self.Dist.n_params)) ** 0.5) / 2
         return state
 
     def __setstate__(self, state_dict):
+        # Recreate the object which could not be pickled
+        name_to_dist_dict = {"Categorical": k_categorical, "MVN": MultivariateNormal}
         if "K" in state_dict.keys():
-            state_dict["Dist"] = k_categorical(state_dict["K"])
+            state_dict["Dist"] = name_to_dist_dict[state_dict["Dist_name"]](
+                state_dict["K"]
+            )
         state_dict["Manifold"] = manifold(state_dict["Score"], state_dict["Dist"])
         self.__dict__ = state_dict
 
@@ -120,7 +148,10 @@ class NGBoost:
             )
 
         if self.col_sample != 1.0:
-            col_size = int(self.col_sample * X.shape[1])
+            if self.col_sample > 0.0:
+                col_size = max(1, int(self.col_sample * X.shape[1]))
+            else:
+                col_size = 0
             col_idx = self.random_state.choice(
                 np.arange(X.shape[1]), col_size, replace=False
             )
@@ -137,13 +168,17 @@ class NGBoost:
         )
 
     def fit_base(self, X, grads, sample_weight=None):
-        models = [
-            clone(self.Base).fit(X, g, sample_weight=sample_weight) for g in grads.T
-        ]
+        if sample_weight is None:
+            models = [clone(self.Base).fit(X, g) for g in grads.T]
+        else:
+            models = [
+                clone(self.Base).fit(X, g, sample_weight=sample_weight) for g in grads.T
+            ]
         fitted = np.array([m.predict(X) for m in models]).T
         self.base_models.append(models)
         return fitted
 
+    # pylint: disable=too-many-positional-arguments
     def line_search(self, resids, start, Y, sample_weight=None, scale_init=1):
         D_init = self.Manifold(start.T)
         loss_init = D_init.total_score(Y, sample_weight)
@@ -173,6 +208,7 @@ class NGBoost:
         self.scalings.append(scale)
         return scale
 
+    # pylint: disable=too-many-positional-arguments
     def fit(
         self,
         X,
@@ -199,9 +235,9 @@ class NGBoost:
             Y_val                 : DataFrame object or List or
                                     numpy array of validation-set outcomes in numeric format
             sample_weight         : how much to weigh each example in the training set.
-                                    numpy array of size (n) (defaults to 1)
+                                    numpy array of size (n) (defaults to None)
             val_sample_weight     : how much to weigh each example in the validation set.
-                                    (defaults to 1)
+                                    (defaults to None)
             train_loss_monitor    : a custom score or set of scores to track on the training set
                                     during training. Defaults to the score defined in the NGBoost
                                     constructor
@@ -215,10 +251,144 @@ class NGBoost:
             A fit NGBRegressor object
         """
 
+        self.base_models = []
+        self.scalings = []
+        self.col_idxs = []
+
+        return self.partial_fit(
+            X,
+            Y,
+            X_val=X_val,
+            Y_val=Y_val,
+            sample_weight=sample_weight,
+            val_sample_weight=val_sample_weight,
+            train_loss_monitor=train_loss_monitor,
+            val_loss_monitor=val_loss_monitor,
+            early_stopping_rounds=early_stopping_rounds,
+        )
+
+    # pylint: disable=too-many-positional-arguments
+    def partial_fit(
+        self,
+        X,
+        Y,
+        X_val=None,
+        Y_val=None,
+        sample_weight=None,
+        val_sample_weight=None,
+        train_loss_monitor=None,
+        val_loss_monitor=None,
+        early_stopping_rounds=None,
+    ):
+        """
+        Fits an NGBoost model to the data appending base models to the existing ones.
+
+        NOTE: This method is not yet fully tested and may not work as expected, for example,
+        the first call to partial_fit will be the most signifcant and later calls will just
+        retune the model to newer data at the cost of making it more expensive. Use with caution.
+
+        Parameters:
+            X                     : DataFrame object or List or
+                                    numpy array of predictors (n x p) in Numeric format
+            Y                     : DataFrame object or List or numpy array of outcomes (n)
+                                    in numeric format. Should be floats for regression and
+                                    integers from 0 to K-1 for K-class classification
+            X_val                 : DataFrame object or List or
+                                    numpy array of validation-set predictors in numeric format
+            Y_val                 : DataFrame object or List or
+                                    numpy array of validation-set outcomes in numeric format
+            sample_weight         : how much to weigh each example in the training set.
+                                    numpy array of size (n) (defaults to None)
+            val_sample_weight     : how much to weigh each example in the validation set.
+                                    (defaults to None)
+            train_loss_monitor    : a custom score or set of scores to track on the training set
+                                    during training. Defaults to the score defined in the NGBoost
+                                    constructor
+            val_loss_monitor      : a custom score or set of scores to track on the validation set
+                                    during training. Defaults to the score defined in the NGBoost
+                                    constructor
+            early_stopping_rounds : the number of consecutive boosting iterations during which
+                                    the loss has to increase before the algorithm stops early.
+
+        Output:
+            A fit NGBRegressor object
+        """
+
+        if len(self.base_models) != len(self.scalings) or len(self.base_models) != len(
+            self.col_idxs
+        ):
+            raise RuntimeError(
+                "Base models, scalings, and col_idxs are not the same length"
+            )
+
+        # if early stopping is specified, split X,Y and sample weights (if given) into training and validation sets
+        # This will overwrite any X_val and Y_val values passed by the user directly.
+        if self.early_stopping_rounds is not None:
+            early_stopping_rounds = self.early_stopping_rounds
+            if X_val is None and Y_val is None:
+                print(
+                    f"early_stopping_rounds is set to {early_stopping_rounds} but no validation set is provided creating val set with {self.validation_fraction} of the training data"
+                )
+                if sample_weight is None:
+                    print(
+                        "Creating validation set without sample weight similar to the training data"
+                    )
+                    X, X_val, Y, Y_val = train_test_split(
+                        X,
+                        Y,
+                        test_size=self.validation_fraction,
+                        random_state=self.random_state,
+                    )
+
+                else:
+                    print(
+                        "Creating validation set with sample weight similar to the training data"
+                    )
+                    (
+                        X,
+                        X_val,
+                        Y,
+                        Y_val,
+                        sample_weight,
+                        val_sample_weight,
+                    ) = train_test_split(
+                        X,
+                        Y,
+                        sample_weight,
+                        test_size=self.validation_fraction,
+                        random_state=self.random_state,
+                    )
+            elif X_val is not None and Y_val is not None:
+                if sample_weight is not None and val_sample_weight is None:
+                    raise ValueError(
+                        "Training data is passed with sample weights but the validation data is missing sample weights pass the appropriate val_sample_weights"
+                    )
+                if sample_weight is None and val_sample_weight is not None:
+                    raise ValueError(
+                        "sample weights mismatch between training and validation data check and pass the appropriate val_sample_weights"
+                    )
+
+                print("Using passed validation data to check for early stopping.")
+
+            else:
+                if (X_val is not None and Y_val is None) or (
+                    X_val is None and Y_val is not None
+                ):
+                    raise ValueError(
+                        "Inconsistent Validation data either X_val or Y_val is missing, check the data"
+                    )
+
         if Y is None:
             raise ValueError("y cannot be None")
 
-        X, Y = check_X_y(X, Y, y_numeric=True)
+        X, Y = check_X_y(
+            X,
+            Y,
+            accept_sparse=True,
+            ensure_all_finite="allow-nan",
+            multi_output=self.multi_output,
+            y_numeric=True,
+        )
 
         self.n_features = X.shape[1]
 
@@ -226,23 +396,31 @@ class NGBoost:
         self.fit_init_params_to_marginal(Y)
 
         params = self.pred_param(X)
+
         if X_val is not None and Y_val is not None:
-            X_val, Y_val = check_X_y(X_val, Y_val, y_numeric=True)
+            X_val, Y_val = check_X_y(
+                X_val,
+                Y_val,
+                accept_sparse=True,
+                ensure_all_finite="allow-nan",
+                multi_output=self.multi_output,
+                y_numeric=True,
+            )
             val_params = self.pred_param(X_val)
             val_loss_list = []
             best_val_loss = np.inf
 
         if not train_loss_monitor:
-            train_loss_monitor = lambda D, Y, W: D.total_score(  # NOQA
+            train_loss_monitor = lambda D, Y, W: D.total_score(  # noqa: E731
                 Y, sample_weight=W
             )
 
         if not val_loss_monitor:
-            val_loss_monitor = lambda D, Y: D.total_score(  # NOQA
+            val_loss_monitor = lambda D, Y: D.total_score(  # noqa: E731
                 Y, sample_weight=val_sample_weight
-            )  # NOQA
+            )
 
-        for itr in range(self.n_estimators):
+        for itr in range(len(self.col_idxs), self.n_estimators + len(self.col_idxs)):
             _, col_idx, X_batch, Y_batch, weight_batch, P_batch = self.sample(
                 X, Y, sample_weight, params
             )
@@ -257,7 +435,6 @@ class NGBoost:
             proj_grad = self.fit_base(X_batch, grads, weight_batch)
             scale = self.line_search(proj_grad, P_batch, Y_batch, weight_batch)
 
-            # pdb.set_trace()
             params -= (
                 self.learning_rate
                 * scale
@@ -314,6 +491,37 @@ class NGBoost:
 
         return self
 
+    def set_params(self, **parameters):
+        for parameter, value in parameters.items():
+            setattr(self, parameter, value)
+        return self
+
+    def get_params(self, deep=True):
+        """
+        Parameters
+        ----------
+        deep : Ignored. (for compatibility with sklearn)
+        Returns
+        ----------
+        params : returns an dictionary of parameters.
+        """
+        params = {
+            "Dist": self.Dist,
+            "Score": self.Score,
+            "Base": self.Base,
+            "natural_gradient": self.natural_gradient,
+            "n_estimators": self.n_estimators,
+            "learning_rate": self.learning_rate,
+            "minibatch_frac": self.minibatch_frac,
+            "col_sample": self.col_sample,
+            "verbose": self.verbose,
+            "random_state": self.random_state,
+            "validation_fraction": self.validation_fraction,
+            "early_stopping_rounds": self.early_stopping_rounds,
+        }
+
+        return params
+
     def score(self, X, Y):  # for sklearn
         return self.Manifold(self.pred_dist(X)._params).total_score(Y)
 
@@ -330,15 +538,11 @@ class NGBoost:
             A NGBoost distribution object
         """
 
-        X = check_array(X)
+        X = check_array(X, accept_sparse=True, ensure_all_finite="allow-nan")
 
-        if (
-            max_iter is not None
-        ):  # get prediction at a particular iteration if asked for
-            dist = self.staged_pred_dist(X, max_iter=max_iter)[-1]
-        else:
-            params = np.asarray(self.pred_param(X, max_iter))
-            dist = self.Dist(params.T)
+        params = np.asarray(self.pred_param(X, max_iter))
+        dist = self.Dist(params.T)
+
         return dist
 
     def staged_pred_dist(self, X, max_iter=None):
@@ -356,7 +560,7 @@ class NGBoost:
         m, n = X.shape
         params = np.ones((m, self.Dist.n_params)) * self.init_params
         for i, (models, s, col_idx) in enumerate(
-            zip(self.base_models, self.scalings, self.col_idxs)
+            zip(self.base_models, self.scalings, self.col_idxs), start=1
         ):
             resids = np.array([model.predict(X[:, col_idx]) for model in models]).T
             params -= self.learning_rate * resids * s
@@ -381,7 +585,7 @@ class NGBoost:
             Numpy array of the estimates of Y
         """
 
-        X = check_array(X)
+        X = check_array(X, accept_sparse=True, ensure_all_finite="allow-nan")
 
         return self.pred_dist(X, max_iter=max_iter).predict()
 
@@ -429,8 +633,10 @@ class NGBoost:
 
         if not all_params_importances:
             return np.zeros(
-                len(self.base_models[0]),
-                self.base_models[0][0].n_features_,
+                (
+                    len(self.base_models[0]),
+                    self.base_models[0][0].n_features_,
+                ),
                 dtype=np.float64,
             )
 

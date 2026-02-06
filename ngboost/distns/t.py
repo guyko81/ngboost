@@ -1,4 +1,5 @@
 """The NGBoost Student T distribution and scores"""
+
 import numpy as np
 from scipy.special import digamma
 from scipy.stats import t as dist
@@ -60,7 +61,7 @@ class T(RegressionDistn):
         super().__init__(params)
         self.loc = params[0]
         self.scale = np.exp(params[1])
-        self.var = self.scale ** 2
+        self.var = self.scale**2
         self.df = np.exp(params[2])
         self.dist = dist(loc=self.loc, scale=self.scale, df=self.df)
 
@@ -123,7 +124,7 @@ class TFixedDf(RegressionDistn):
         super().__init__(params)
         self.loc = params[0]
         self.scale = np.exp(params[1])
-        self.var = self.scale ** 2
+        self.var = self.scale**2
         # fixed df
         self.df = np.ones_like(self.loc) * self.fixed_df
         self.dist = dist(loc=self.loc, scale=self.scale, df=self.df)

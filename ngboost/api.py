@@ -10,8 +10,10 @@ from ngboost.distns import (
     Normal,
     RegressionDistn,
 )
+from ngboost.distns.utils import SurvivalDistnClass
 from ngboost.helpers import Y_from_censored
 from ngboost.learners import default_tree_learner
+from ngboost.manifold import manifold
 from ngboost.ngboost import NGBoost
 from ngboost.scores import LogScore
 
@@ -41,10 +43,18 @@ class NGBRegressor(NGBoost, BaseEstimator):
         tol               : numerical tolerance to be used in optimization
         random_state      : seed for reproducibility. See
                             https://stackoverflow.com/questions/28064634/random-state-pseudo-random-number-in-scikit-learn
+        validation_fraction: Proportion of training data to set
+                             aside as validation data for early stopping.
+        early_stopping_rounds:      The number of consecutive boosting iterations during which the
+                                    loss has to increase before the algorithm stops early.
+                                    Set to None to disable early stopping and validation.
+                                    None enables running over the full data set.
+
     Output:
         An NGBRegressor object that can be fit.
     """
 
+    # pylint: disable=too-many-positional-arguments
     def __init__(
         self,
         Dist=Normal,
@@ -59,6 +69,8 @@ class NGBRegressor(NGBoost, BaseEstimator):
         verbose_eval=100,
         tol=1e-4,
         random_state=None,
+        validation_fraction=0.1,
+        early_stopping_rounds=None,
     ):
         assert issubclass(
             Dist, RegressionDistn
@@ -82,7 +94,11 @@ class NGBRegressor(NGBoost, BaseEstimator):
             verbose_eval,
             tol,
             random_state,
+            validation_fraction,
+            early_stopping_rounds,
         )
+
+        self._estimator_type = "regressor"
 
     def __getstate__(self):
         state = super().__getstate__()
@@ -124,9 +140,10 @@ class NGBClassifier(NGBoost, BaseEstimator):
         random_state      : seed for reproducibility. See
                             https://stackoverflow.com/questions/28064634/random-state-pseudo-random-number-in-scikit-learn
     Output:
-        An NGBRegressor object that can be fit.
+        An NGBClassifier object that can be fit.
     """
 
+    # pylint: disable=too-many-positional-arguments
     def __init__(
         self,
         Dist=Bernoulli,
@@ -159,6 +176,7 @@ class NGBClassifier(NGBoost, BaseEstimator):
             tol,
             random_state,
         )
+        self._estimator_type = "classifier"
 
     def predict_proba(self, X, max_iter=None):
         """
@@ -194,7 +212,7 @@ class NGBSurvival(NGBoost, BaseEstimator):
     """
     Constructor for NGBoost survival models.
 
-    NGBRegressor is a wrapper for the generic NGBoost class that facilitates survival analysis.
+    NGBSurvival is a wrapper for the generic NGBoost class that facilitates survival analysis.
     Use this class if you want to predict an outcome that could take an infinite number of
     (ordered) values, but right-censoring is present in the observed data.
 
@@ -216,9 +234,10 @@ class NGBSurvival(NGBoost, BaseEstimator):
         random_state      : seed for reproducibility. See
                             https://stackoverflow.com/questions/28064634/random-state-pseudo-random-number-in-scikit-learn
     Output:
-        An NGBRegressor object that can be fit.
+        An NGBSurvival object that can be fit.
     """
 
+    # pylint: disable=too-many-positional-arguments
     def __init__(
         self,
         Dist=LogNormal,
@@ -243,15 +262,7 @@ class NGBSurvival(NGBoost, BaseEstimator):
                 f"The {Dist.__name__} distribution does not have any censored scores implemented."
             )
 
-        class SurvivalDistn(
-            Dist
-        ):  # Creates a new dist class from a given dist. The new class has its implemented scores
-            scores = (
-                Dist.censored_scores
-            )  # set to the censored versions of the scores implemented for dist
-
-            def fit(Y):  # and expects a {time, event} array as Y.
-                return Dist.fit(Y["Time"])
+        SurvivalDistn = SurvivalDistnClass(Dist)
 
         # assert issubclass(Dist, RegressionDistn), f'{Dist.__name__} is not useable for survival.'
         super().__init__(
@@ -269,6 +280,23 @@ class NGBSurvival(NGBoost, BaseEstimator):
             random_state,
         )
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Remove the unpicklable entries.
+        # Both of the below contain SurvivalDistn
+        del state["Manifold"]
+        state["_basedist"] = state["Dist"]._basedist
+        del state["Dist"]
+        return state
+
+    def __setstate__(self, state_dict):
+        # Recreate the object which could not be pickled
+        state_dict["Dist"] = SurvivalDistnClass(state_dict["_basedist"])
+        del state_dict["_basedist"]
+        state_dict["Manifold"] = manifold(state_dict["Score"], state_dict["Dist"])
+        self.__dict__ = state_dict
+
+    # pylint: disable=too-many-positional-arguments
     def fit(self, X, T, E, X_val=None, T_val=None, E_val=None, **kwargs):
         """Fits an NGBoost survival model to the data.
         For additional parameters see ngboost.NGboost.fit
@@ -287,10 +315,10 @@ class NGBSurvival(NGBoost, BaseEstimator):
                                     validation-set event idicators, in numeric format if any
         """
 
-        X = check_array(X)
+        X = check_array(X, accept_sparse=True)
 
         if X_val is not None:
-            X_val = check_array(X_val)
+            X_val = check_array(X_val, accept_sparse=True)
 
         return super().fit(
             X,
