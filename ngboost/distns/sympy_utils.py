@@ -69,6 +69,19 @@ def _build_lambdified(expr, ordered_symbols, extra_symbols=None):
     return lambdify(dummies, expr_safe, modules=["scipy", "numpy"])
 
 
+def _extract_neglog_sum_terms(score_expr):
+    """If *score_expr* has the form ``-log(t1 + t2 + ... + tk)``, return the terms.
+
+    This detects mixture-like NLL expressions that benefit from logsumexp
+    evaluation.  Returns ``None`` if the expression does not match.
+    """
+    for log_term in score_expr.atoms(sym.log):
+        arg = log_term.args[0]
+        if isinstance(arg, sym.Add) and sym.simplify(score_expr + log_term) == 0:
+            return list(arg.args)
+    return None
+
+
 def _try_analytical_fi(score_expr, params, y, grad_exprs, extra_params, sympy_dist):
     """Attempt to compute analytical Fisher Information.
 
@@ -213,23 +226,27 @@ def make_sympy_log_score(
         # (which overflows when alpha<1 and y≈0).
         score_expr = sym.expand_log(score_expr, force=True)
 
-    # Simplify unsimplified fractions inside remaining log() calls, then
-    # re-expand.  E.g. log(1 - a/(a+b)) → log(b/(a+b)) → log(b) - log(a+b).
-    # Without this, lambdify evaluates 1 - a/(a+b) ≈ 0 for large a, giving log(0).
-    # Only touch log(Add(...)) where the sum contains a fraction, e.g.
-    # log(1 - a/(a+b)).  Skip log(ratio) like log(y/(1-y)) — cancel()
-    # would flip signs and introduce complex numbers.
-    for log_term in list(score_expr.atoms(sym.log)):
-        arg = log_term.args[0]
-        if isinstance(arg, sym.Add):
-            _, denom = arg.as_numer_denom()
-            if denom != 1:
-                arg_simplified = sym.cancel(arg)
-                if arg_simplified != arg:
-                    score_expr = score_expr.subs(
-                        log_term,
-                        sym.expand_log(sym.log(arg_simplified), force=True),
-                    )
+    # ---- Detect logsumexp-amenable form BEFORE log-cleanup ----
+    # For mixture-like scores of the form -log(t1 + t2 + ... + tk),
+    # cancel() on sub-expressions creates cross-terms that overflow.
+    # Detect this first so we can skip the problematic transformation.
+    _lse_terms = _extract_neglog_sum_terms(score_expr)
+
+    if _lse_terms is None:
+        # Simplify fractions inside log() calls, e.g.
+        # log(1 - a/(a+b)) → log(b/(a+b)) → log(b) - log(a+b).
+        # Skip for logsumexp path (cancel would merge mixture terms).
+        for log_term in list(score_expr.atoms(sym.log)):
+            arg = log_term.args[0]
+            if isinstance(arg, sym.Add):
+                _, denom = arg.as_numer_denom()
+                if denom != 1:
+                    arg_simplified = sym.cancel(arg)
+                    if arg_simplified != arg:
+                        score_expr = score_expr.subs(
+                            log_term,
+                            sym.expand_log(sym.log(arg_simplified), force=True),
+                        )
 
     # Replace log(beta(a,b)) → loggamma(a)+loggamma(b)-loggamma(a+b)
     # and log(gamma(x)) → loggamma(x) so lambdify uses scipy.special.gammaln
@@ -248,29 +265,142 @@ def make_sympy_log_score(
 
     extra_params = extra_params or []
     param_symbols = [p for p, _ in params]
+    n_params = len(params)
 
-    # ---- score function ----
-    _score_fn = _build_lambdified(score_expr, [y], param_symbols + extra_params)
+    _param_names = [str(p) for p, _ in params]
+    _extra_names = [str(e) for e in extra_params]
 
-    # ---- d_score (gradient w.r.t. internal parameters) ----
-    # Use cancel() instead of simplify() — much faster for complex expressions
-    # (e.g. mixture PDFs) while still combining rational sub-expressions.
+    def _get_param_arrays(self_obj):
+        param_arrays = [getattr(self_obj, n) for n in _param_names]
+        extra_arrays = [getattr(self_obj, n) for n in _extra_names]
+        return param_arrays, extra_arrays
+
+    # ---- gradient expressions (needed for FI in all paths) ----
     grad_exprs = []
     for psym, is_log in params:
         raw_deriv = sym.diff(score_expr, psym)
         if is_log:
-            grad_exprs.append(sym.cancel(psym * raw_deriv))
+            grad_exprs.append(psym * raw_deriv)
         else:
-            grad_exprs.append(sym.cancel(raw_deriv))
+            grad_exprs.append(raw_deriv)
 
-    _grad_fns = [
-        _build_lambdified(g, [y], param_symbols + extra_params) for g in grad_exprs
-    ]
+    if _lse_terms is not None:
+        # ---- Logsumexp path: numerically stable for mixture-like scores ----
+        # Instead of evaluating -log(pdf1 + pdf2 + ...) directly (which
+        # underflows to log(0) when individual PDFs are tiny), decompose
+        # into log(pdf_k) per term and use scipy.special.logsumexp.
+        # Gradients use the identity:
+        #   d/dθ[-log Σ_k f_k] = -Σ_k (f_k/Σ_j f_j) · d(log f_k)/dθ
+        #                       = -Σ_k softmax_k · d(log f_k)/dθ
+        from scipy.special import logsumexp as _scipy_logsumexp
+
+        _K = len(_lse_terms)
+        _log_term_exprs = [
+            sym.expand_log(sym.log(t), force=True) for t in _lse_terms
+        ]
+        _log_term_fns = [
+            _build_lambdified(lt, [y], param_symbols + extra_params)
+            for lt in _log_term_exprs
+        ]
+
+        # d(log f_k) / d(internal_param_j) for each term k and param j
+        _d_log_term_fns = []
+        for lt in _log_term_exprs:
+            row = []
+            for psym, is_log in params:
+                raw = sym.diff(lt, psym)
+                g = psym * raw if is_log else raw
+                row.append(
+                    _build_lambdified(g, [y], param_symbols + extra_params)
+                )
+            _d_log_term_fns.append(row)
+
+        # Smallest positive float64, used to clamp Y > 0 for log-space
+        # evaluation.  Prevents log(0) = -inf cascading to NaN.
+        _TINY = np.finfo(float).tiny
+
+        def _eval_log_terms(all_args):
+            """Evaluate log(f_k) for each mixture term, clamping to avoid -inf."""
+            log_vals = np.stack(
+                [fn(*all_args) for fn in _log_term_fns], axis=0
+            )
+            # Replace non-finite values BEFORE clipping.  np.clip does not
+            # fix NaN, and NaN propagates through logsumexp → weights → D.
+            # NaN arises when sigma^2 underflows to 0 (giving 0/0) or when
+            # exp(logit) overflows (giving inf/inf).
+            log_vals = np.nan_to_num(
+                log_vals, nan=-1e15, posinf=700, neginf=-1e15
+            )
+            np.clip(log_vals, -1e15, None, out=log_vals)
+            return log_vals
+
+        def _safe_args(all_args):
+            """Clamp Y and parameters to safe numerical ranges.
+
+            Prevents exp() overflow inside lambdified expressions (e.g.
+            ``exp(logit_w)`` when logit grows beyond ~710) and log(0)
+            when Y underflows.
+            """
+            Y = np.asarray(all_args[0], dtype=float)
+            Y_safe = np.clip(Y, _TINY, None)
+            safe = [Y_safe]
+            for arg in all_args[1:]:
+                arr = np.asarray(arg, dtype=float)
+                safe.append(np.clip(arr, -_EXP_CLIP, _EXP_CLIP))
+            return safe
+
+        def _score_fn(Y_arr, *all_params):
+            all_args = _safe_args([Y_arr] + list(all_params))
+            return -_scipy_logsumexp(_eval_log_terms(all_args), axis=0)
+
+        def score_method(self, Y):
+            param_arrays, extra_arrays = _get_param_arrays(self)
+            return _score_fn(Y, *param_arrays, *extra_arrays)
+
+        def d_score_method(self, Y):
+            param_arrays, extra_arrays = _get_param_arrays(self)
+            all_args = _safe_args([Y] + param_arrays + extra_arrays)
+            log_vals = _eval_log_terms(all_args)
+            lse = _scipy_logsumexp(log_vals, axis=0, keepdims=True)
+            weights = np.exp(log_vals - lse)
+            D = np.zeros((len(Y), n_params))
+            for j in range(n_params):
+                for k in range(_K):
+                    grad_k = np.asarray(
+                        _d_log_term_fns[k][j](*all_args), dtype=float
+                    )
+                    grad_k = np.where(np.isfinite(grad_k), grad_k, 0.0)
+                    D[:, j] -= weights[k] * grad_k
+            # Clamp extreme gradient values that arise when MC samples
+            # land far outside all component supports.  These would
+            # otherwise corrupt the Fisher Information estimate.
+            np.clip(D, -1e6, 1e6, out=D)
+            return D
+
+    else:
+        # ---- Standard path: direct lambdification ----
+        _score_fn = _build_lambdified(
+            score_expr, [y], param_symbols + extra_params
+        )
+
+        _grad_fns = [
+            _build_lambdified(g, [y], param_symbols + extra_params)
+            for g in grad_exprs
+        ]
+
+        def score_method(self, Y):
+            param_arrays, extra_arrays = _get_param_arrays(self)
+            return _score_fn(Y, *param_arrays, *extra_arrays)
+
+        def d_score_method(self, Y):
+            param_arrays, extra_arrays = _get_param_arrays(self)
+            D = np.zeros((len(Y), n_params))
+            for k, gfn in enumerate(_grad_fns):
+                D[:, k] = gfn(Y, *param_arrays, *extra_arrays)
+            return D
 
     # ---- metric (Fisher Information) ----
-    n_params = len(params)
     fi_fns = None
-
     fi_exprs = _try_analytical_fi(
         score_expr, params, y, grad_exprs, extra_params, sympy_dist
     )
@@ -286,28 +416,6 @@ def make_sympy_log_score(
                 )
             fi_fns.append(row)
 
-    # ---- Build the class ----
-    class_name = name or "SympyLogScore"
-
-    _param_names = [str(p) for p, _ in params]
-    _extra_names = [str(e) for e in extra_params]
-
-    def _get_param_arrays(self_obj):
-        param_arrays = [getattr(self_obj, n) for n in _param_names]
-        extra_arrays = [getattr(self_obj, n) for n in _extra_names]
-        return param_arrays, extra_arrays
-
-    def score_method(self, Y):
-        param_arrays, extra_arrays = _get_param_arrays(self)
-        return _score_fn(Y, *param_arrays, *extra_arrays)
-
-    def d_score_method(self, Y):
-        param_arrays, extra_arrays = _get_param_arrays(self)
-        D = np.zeros((len(Y), n_params))
-        for k, gfn in enumerate(_grad_fns):
-            D[:, k] = gfn(Y, *param_arrays, *extra_arrays)
-        return D
-
     if fi_fns is not None:
 
         def metric_method(self):
@@ -319,8 +427,23 @@ def make_sympy_log_score(
                     FI[:, i, j] = fi_fns[i][j](*param_arrays, *extra_arrays)
             return FI
 
+    elif _lse_terms is not None:
+        # Logsumexp path: MC metric with ridge regularization.
+        # Mixture gradients can be very large for MC samples that land far
+        # from all component modes, making the FI estimate ill-conditioned.
+        # A small ridge on the diagonal ensures positive definiteness.
+
+        def metric_method(self, n_mc_samples=100):
+            FI = LogScore.metric(self, n_mc_samples)
+            FI = np.where(np.isfinite(FI), FI, 0.0)
+            FI[:, range(n_params), range(n_params)] += 1e-4
+            return FI
+
     else:
         metric_method = None
+
+    # ---- Build the class ----
+    class_name = name or "SympyLogScore"
 
     attrs = {
         "score": score_method,
@@ -330,7 +453,6 @@ def make_sympy_log_score(
         attrs["metric"] = metric_method
 
     cls = type(class_name, (LogScore,), attrs)
-    # Expose the raw lambdified score for reuse (e.g. numerical MLE fit).
     cls._score_fn = _score_fn
     return cls
 
