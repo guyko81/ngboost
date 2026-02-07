@@ -350,10 +350,13 @@ implementations numerically (score, d_score, and metric) — using only
 
 | Notebook                          | Pattern demonstrated                          |
 |----------------------------------|-----------------------------------------------|
+| `notebooks/example_normal.ipynb`         | `make_distribution` from scratch, verified against built-in Normal |
 | `notebooks/example_beta.ipynb`           | `make_distribution` with `sympy.stats` + scipy |
-| `notebooks/example_logitnormal.ipynb`    | `make_distribution` with manual `score_expr`   |
-| `notebooks/example_betabernoulli.ipynb`  | `make_sympy_log_score` + `ClassificationDistn` |
+| `notebooks/example_logitnormal.ipynb`    | `make_distribution` with manual `score_expr` + custom `sample_fn` |
+| `notebooks/example_betabernoulli.ipynb`  | `make_sympy_log_score` + `ClassificationDistn` wrapper |
 | `notebooks/example_betabinomial.ipynb`   | `make_sympy_log_score` + extra params + custom `fit` |
+| `notebooks/example_mixture_lognormal.ipynb` | Advanced: 8-param mixture of 3 log-normals with logsumexp path |
+| `notebooks/sympy_normal_demo.ipynb`      | Deep dive: symbolic expressions, verification against hand-written code |
 
 ## Reference: SymPy-Powered Distributions
 
