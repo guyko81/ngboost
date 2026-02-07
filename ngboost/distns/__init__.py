@@ -8,6 +8,7 @@ from .gamma import Gamma
 from .halfnormal import HalfNormal
 from .laplace import Laplace
 from .lognormal import LogNormal
+from .beta import Beta
 from .multivariate_normal import MultivariateNormal
 from .normal import Normal, NormalFixedMean, NormalFixedVar
 from .poisson import Poisson
