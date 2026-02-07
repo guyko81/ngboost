@@ -21,6 +21,13 @@ from ngboost.scores import LogScore
 # enough that no reasonable model would be affected.
 _EXP_CLIP = 700
 
+# Minimum value for log-transformed natural parameters (e.g. sigma, alpha).
+# Lambdified expressions often contain 1/param^2; if param is too small,
+# param^2 underflows to 0 → divide-by-zero, or 1/param^2 overflows.
+# exp(-150)^2 = exp(-300) ≈ 5e-131 — safely positive in float64 and
+# 1/exp(-300) = exp(300) ≈ 2e130 — safely below float64 max.
+_LOG_PARAM_MIN = np.exp(-150)
+
 
 def _density_from_piecewise(pw, y):
     """Convert a Piecewise density to a smooth expression for differentiation.
@@ -277,9 +284,9 @@ def make_sympy_log_score(
             val = np.asarray(getattr(self_obj, name), dtype=float)
             if is_log:
                 # Log-transformed params must be positive and finite.
-                # Clamp to [tiny, exp(700)] in case __init__ didn't clip
-                # the internal params before exp().
-                val = np.clip(val, np.finfo(float).tiny, _EXP_CLIP_VAL)
+                # Lower bound prevents param^2 underflow and 1/param^2
+                # overflow in lambdified expressions (see _LOG_PARAM_MIN).
+                val = np.clip(val, _LOG_PARAM_MIN, _EXP_CLIP_VAL)
             param_arrays.append(val)
         extra_arrays = [getattr(self_obj, n) for n in _extra_names]
         return param_arrays, extra_arrays
@@ -564,7 +571,7 @@ def make_distribution(
         RegressionDistn.__init__(self, internal_params)
         for i, (pname, is_log) in enumerate(param_info):
             if is_log:
-                val = np.exp(np.clip(internal_params[i], -_EXP_CLIP, _EXP_CLIP))
+                val = np.exp(np.clip(internal_params[i], -150, _EXP_CLIP))
             else:
                 val = internal_params[i]
             setattr(self, pname, val)

@@ -9,43 +9,41 @@ tedious and error-prone. Each distribution requires:
 - Chain-rule adjustments for log-transformed parameters
 - Fisher Information computation (expected Hessian)
 
-The `make_sympy_log_score` factory automates all of this. You define the
-distribution, and the factory produces a complete `LogScore` subclass with
-correct `score()`, `d_score()`, and `metric()` methods — no calculus needed.
+Two factories are provided:
 
-## How to Add a New Distribution (2 Steps)
+- `make_distribution` — creates a **complete distribution class** ready for
+  `NGBRegressor(Dist=...)`. This is the recommended entry point.
+- `make_sympy_log_score` — creates just the **LogScore subclass** (for advanced
+  use when you want to write the Distn class yourself).
 
-### Step 1: Define the distribution and call the factory
+## Quickstart: One Function Call
 
 ```python
 import sympy as sp
 import sympy.stats as symstats
-from ngboost.distns.sympy_utils import make_sympy_log_score
+import scipy.stats
+from ngboost.distns.sympy_utils import make_distribution
 
 alpha, beta, y = sp.symbols("alpha beta y", positive=True)
 
-BetaLogScore = make_sympy_log_score(
-    params=[(alpha, True), (beta, True)],  # True = log-transformed
+Beta = make_distribution(
+    params=[(alpha, True), (beta, True)],
     y=y,
     sympy_dist=symstats.Beta("Y", alpha, beta),
-    name="BetaLogScore",
+    scipy_dist_cls=scipy.stats.beta,
+    scipy_kwarg_map={"a": alpha, "b": beta},
+    name="Beta",
 )
+
+# Ready to use with NGBoost
+from ngboost import NGBRegressor
+ngb = NGBRegressor(Dist=Beta)
+ngb.fit(X_train, Y_train)
+ngb.predict(X_test)
 ```
 
-That's it. The factory auto-derives `score()` from the distribution's density,
-computes `d_score()` via symbolic differentiation, and tries to compute
-`metric()` analytically (falling back to Monte Carlo if needed).
-
-### Step 2: Wire up the distribution class
-
-```python
-class Beta(RegressionDistn):
-    n_params = 2
-    scores = [BetaLogScore]
-    # ... __init__, fit, sample, params as usual
-```
-
-No hand-written derivatives needed.
+That's it. The factory auto-derives score, gradients, and Fisher Information
+from the SymPy distribution, and auto-generates fit/sample/mean from scipy.
 
 ## When You Need a Manual Score Expression
 

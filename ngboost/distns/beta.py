@@ -1,55 +1,27 @@
-"""The NGBoost Beta distribution and scores"""
+"""The NGBoost Beta distribution — built via the SymPy factory.
 
-import numpy as np
+Use for regression on bounded (0, 1) outcomes: proportions, rates,
+probabilities, fractions, percentages.  Examples: click-through rates,
+exam scores as fractions, market share, fraction of defective items.
+
+This is the simplest factory pattern: provide a ``sympy.stats``
+distribution and a ``scipy.stats`` class, and the factory auto-derives
+score, gradient, Fisher Information, fit, sample, quantiles, etc.
+"""
+
+import scipy.stats
 import sympy as sp
 import sympy.stats as symstats
-from scipy.stats import beta as dist
 
-from ngboost.distns.distn import RegressionDistn
-from ngboost.distns.sympy_utils import make_sympy_log_score
+from ngboost.distns.sympy_utils import make_distribution
 
-# --- SymPy-generated LogScore ---
 _alpha, _beta, _y = sp.symbols("alpha beta y", positive=True)
 
-BetaLogScore = make_sympy_log_score(
+Beta = make_distribution(
     params=[(_alpha, True), (_beta, True)],
     y=_y,
     sympy_dist=symstats.Beta("Y", _alpha, _beta),
-    name="BetaLogScore",
+    scipy_dist_cls=scipy.stats.beta,
+    scipy_kwarg_map={"a": _alpha, "b": _beta},
+    name="Beta",
 )
-
-
-class Beta(RegressionDistn):
-    """
-    Implements the Beta distribution for NGBoost.
-
-    The Beta distribution has two parameters, alpha and beta, both positive.
-    Internally parameterized as log(alpha) and log(beta).
-    """
-
-    n_params = 2
-    scores = [BetaLogScore]
-
-    def __init__(self, params):
-        super().__init__(params)
-        self.logalpha = params[0]
-        self.logbeta = params[1]
-        self.alpha = np.exp(params[0])
-        self.beta = np.exp(params[1])
-        self.dist = dist(a=self.alpha, b=self.beta)
-
-    def fit(Y):
-        a, b, _, _ = dist.fit(Y, floc=0, fscale=1)
-        return np.array([np.log(a), np.log(b)])
-
-    def sample(self, m):
-        return np.array([self.rvs() for _ in range(m)])
-
-    def __getattr__(self, name):
-        if name in dir(self.dist):
-            return getattr(self.dist, name)
-        return None
-
-    @property
-    def params(self):
-        return {"alpha": self.alpha, "beta": self.beta}

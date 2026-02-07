@@ -1,8 +1,6 @@
 """NGBoost distributions"""
 
 from .beta import Beta
-from .betabernoulli import BetaBernoulli
-from .betabinomial import BetaBinomial
 from .categorical import Bernoulli, k_categorical
 from .cauchy import Cauchy
 from .distn import ClassificationDistn, Distn, RegressionDistn
@@ -20,8 +18,6 @@ from .weibull import Weibull
 
 __all__ = [
     "Beta",
-    "BetaBernoulli",
-    "BetaBinomial",
     "Bernoulli",
     "k_categorical",
     "Cauchy",

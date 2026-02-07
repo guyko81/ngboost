@@ -1,15 +1,27 @@
-"""The NGBoost Logit-Normal distribution and scores"""
+"""The NGBoost Logit-Normal distribution — built via the SymPy factory.
+
+Use for regression on bounded (0, 1) outcomes where the distribution
+of logit(Y) is approximately Normal.  Compared to Beta, LogitNormal can
+capture heavier tails and is more natural when the generative process
+applies a logistic transform to a latent Gaussian.
+
+Examples: bioassay dose-response curves, compositional data proportions,
+species prevalence modeling.
+
+This demonstrates the manual-expression pattern: when no ``sympy.stats``
+equivalent exists, you provide ``score_expr`` (the negative log-likelihood)
+directly, plus a custom ``sample_fn``.  The factory auto-derives score,
+gradient, Fisher Information, and fit (via numerical MLE).
+"""
 
 import numpy as np
 import sympy as sp
-from scipy.stats import norm
 
-from ngboost.distns.distn import RegressionDistn
-from ngboost.distns.sympy_utils import make_sympy_log_score
+from ngboost.distns.sympy_utils import make_distribution
 
-# --- SymPy-generated LogScore ---
 _mu, _sigma, _y = sp.symbols("mu sigma y", positive=True)
 _logit_y = sp.log(_y / (1 - _y))
+
 _score_expr = (
     sp.Rational(1, 2) * sp.log(2 * sp.pi)
     + sp.log(_sigma)
@@ -18,52 +30,19 @@ _score_expr = (
     + sp.log(1 - _y)
 )
 
-LogitNormalLogScore = make_sympy_log_score(
+
+def _sample(self, m):
+    mu, sigma = np.squeeze(self.mu), np.squeeze(self.sigma)
+    return np.array([
+        1 / (1 + np.exp(-np.random.normal(mu, sigma)))
+        for _ in range(m)
+    ])
+
+
+LogitNormal = make_distribution(
     params=[(_mu, False), (_sigma, True)],
     y=_y,
     score_expr=_score_expr,
-    name="LogitNormalLogScore",
+    sample_fn=_sample,
+    name="LogitNormal",
 )
-
-
-class LogitNormal(RegressionDistn):
-    """
-    Implements the Logit-Normal distribution for NGBoost.
-
-    The Logit-Normal distribution has two parameters, mu and sigma.
-    If X ~ Normal(mu, sigma), then Y = 1/(1+exp(-X)) ~ LogitNormal(mu, sigma).
-    """
-
-    n_params = 2
-    scores = [LogitNormalLogScore]
-
-    def __init__(self, params):
-        super().__init__(params)
-        self.mu = params[0]
-        self.logsigma = params[1]
-        self.sigma = np.exp(params[1])
-        self.var = self.sigma**2
-
-    def fit(Y):
-        logit_Y = np.log(Y / (1 - Y))
-        m = np.mean(logit_Y)
-        s = np.std(logit_Y)
-        return np.array([m, np.log(s)])
-
-    def sample(self, m):
-        mu = np.squeeze(self.mu)
-        sigma = np.squeeze(self.sigma)
-        logit_samples = np.random.normal(mu, sigma, size=m)
-        return 1 / (1 + np.exp(-logit_samples))
-
-    def mean(self):
-        # No closed-form mean; approximate via Monte Carlo
-        samples = self.sample(1000)
-        return np.mean(samples, axis=0)
-
-    def predict(self):
-        return self.mean()
-
-    @property
-    def params(self):
-        return {"mu": self.mu, "sigma": self.sigma}
