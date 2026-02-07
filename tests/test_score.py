@@ -9,6 +9,7 @@ from ngboost.distns import (
     Beta,
     BetaBernoulli,
     BetaBinomial,
+    BetaBinomialEstN,
     Cauchy,
     Distn,
     Gamma,
@@ -119,6 +120,7 @@ TEST_GRAD: List[DistScore] = TEST_METRIC + [
     (TFixedDf, LogScore),
     (LogitNormal, LogScore),
     (BetaBinomial, LogScore),
+    (BetaBinomialEstN, LogScore),
 ]
 
 

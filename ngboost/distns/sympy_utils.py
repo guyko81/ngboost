@@ -407,13 +407,17 @@ def make_sympy_log_score(
 
         def score_method(self, Y):
             param_arrays, extra_arrays = _get_param_arrays(self)
-            return _score_fn(Y, *param_arrays, *extra_arrays)
+            with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+                vals = _score_fn(Y, *param_arrays, *extra_arrays)
+                return np.where(np.isfinite(vals), vals, 1e8)
 
         def d_score_method(self, Y):
             param_arrays, extra_arrays = _get_param_arrays(self)
             D = np.zeros((len(Y), n_params))
-            for k, gfn in enumerate(_grad_fns):
-                D[:, k] = gfn(Y, *param_arrays, *extra_arrays)
+            with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+                for k, gfn in enumerate(_grad_fns):
+                    vals = gfn(Y, *param_arrays, *extra_arrays)
+                    D[:, k] = np.where(np.isfinite(vals), vals, 0.0)
             return D
 
     # ---- metric (Fisher Information) ----
@@ -439,10 +443,11 @@ def make_sympy_log_score(
             param_arrays, extra_arrays = _get_param_arrays(self)
             n = param_arrays[0].shape[0]
             FI = np.zeros((n, n_params, n_params))
-            for i in range(n_params):
-                for j in range(n_params):
-                    vals = fi_fns[i][j](*param_arrays, *extra_arrays)
-                    FI[:, i, j] = np.where(np.isfinite(vals), vals, 0.0)
+            with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+                for i in range(n_params):
+                    for j in range(n_params):
+                        vals = fi_fns[i][j](*param_arrays, *extra_arrays)
+                        FI[:, i, j] = np.where(np.isfinite(vals), vals, 0.0)
             # Tiny ridge ensures positive definiteness when overflow
             # zeroed out entries that should be small but positive
             # (e.g. alpha*beta/(alpha+beta)^2 → 0/0 when both huge).
@@ -462,7 +467,16 @@ def make_sympy_log_score(
             return FI
 
     else:
-        metric_method = None
+        # Standard path MC fallback: wrap LogScore.metric with NaN
+        # filtering and a small ridge for robustness (e.g. when
+        # BetaBinomialEstN has n near y, producing NaN gradients).
+
+        def metric_method(self, n_mc_samples=100):
+            with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+                FI = LogScore.metric(self, n_mc_samples)
+            FI = np.where(np.isfinite(FI), FI, 0.0)
+            FI[:, range(n_params), range(n_params)] += 1e-8
+            return FI
 
     # ---- Build the class ----
     class_name = name or "SympyLogScore"
@@ -489,6 +503,7 @@ def make_distribution(
     extra_params=None,
     fit_fn=None,
     sample_fn=None,
+    mean_fn=None,
     class_prob_exprs=None,
     name="SympyDistribution",
 ):
@@ -523,13 +538,21 @@ def make_distribution(
     scipy_kwarg_map : dict[str, sympy.Symbol] or None
         Maps scipy keyword argument names to sympy parameter symbols.
         E.g. ``{"a": alpha, "b": beta}`` for ``scipy.stats.beta(a=, b=)``.
-    extra_params : list[sympy.Symbol] or None
+        May reference extra_params symbols (e.g. ``{"n": n, ...}``).
+    extra_params : list or None
         Non-optimised parameters (e.g. ``n`` in BetaBinomial).
+        Each entry is either a bare ``sympy.Symbol`` (no default, for
+        backward compatibility) or a ``(symbol, default_value)`` tuple.
+        When a default is provided, the generated ``__init__`` accepts
+        it as a keyword argument: ``Dist(params, n=20)``.
     fit_fn : callable or None
         Custom ``fit(Y) -> np.ndarray`` override.  Signature:
         ``fit(Y) -> np.array([internal_param_0, internal_param_1, ...])``.
     sample_fn : callable or None
         Custom ``sample(self, m) -> np.ndarray`` override.
+    mean_fn : callable or None
+        Custom ``mean(self) -> np.ndarray`` override.  When provided,
+        takes precedence over scipy delegation and MC fallback.
     class_prob_exprs : list[sympy.Expr] or None
         SymPy expressions for class probabilities ``[P(Y=0), P(Y=1), ...]``.
         When provided, the result is a ``ClassificationDistn`` subclass
@@ -588,13 +611,25 @@ def make_distribution(
 
     _base_cls = ClassificationDistn if is_classification else RegressionDistn
 
+    # ---- 0. Parse extra_params: accept [(sym, default)] or [sym] ----
+    _extra_param_info = []  # [(symbol, str_name, default_or_None), ...]
+    _extra_symbols = []  # just the symbols, for make_sympy_log_score
+    if extra_params:
+        for ep in extra_params:
+            if isinstance(ep, (tuple, list)):
+                sym_obj, default_val = ep
+            else:
+                sym_obj, default_val = ep, None
+            _extra_param_info.append((sym_obj, str(sym_obj), default_val))
+            _extra_symbols.append(sym_obj)
+
     # ---- 1. Create the LogScore subclass ----
     score_cls = make_sympy_log_score(
         params=params,
         y=y,
         score_expr=score_expr,
         sympy_dist=sympy_dist,
-        extra_params=extra_params,
+        extra_params=_extra_symbols or None,
         name=f"{name}LogScore",
     )
 
@@ -613,14 +648,14 @@ def make_distribution(
     if is_classification:
         _n_classes = len(class_prob_exprs)
         param_symbols = [s for s, _ in params]
-        _extra_syms = extra_params if extra_params else None
+        _extra_syms = _extra_symbols if _extra_symbols else None
         _class_prob_fns = [
             _build_lambdified(expr, param_symbols, _extra_syms)
             for expr in class_prob_exprs
         ]
 
     # ---- 3. __init__ ----
-    def _init(self, internal_params):
+    def _init(self, internal_params, **kwargs):
         _base_cls.__init__(self, internal_params)
         for i, (pname, is_log) in enumerate(param_info):
             if is_log:
@@ -628,9 +663,12 @@ def make_distribution(
             else:
                 val = internal_params[i]
             setattr(self, pname, val)
+        # Set extra (non-optimised) params from kwargs or defaults
+        for _, ep_name, ep_default in _extra_param_info:
+            setattr(self, ep_name, kwargs.get(ep_name, ep_default))
         if scipy_dist_cls is not None and _scipy_map is not None:
-            kwargs = {k: getattr(self, v) for k, v in _scipy_map.items()}
-            self.dist = scipy_dist_cls(**kwargs)
+            sc_kwargs = {k: getattr(self, v) for k, v in _scipy_map.items()}
+            self.dist = scipy_dist_cls(**sc_kwargs)
 
     # ---- 4. fit ----
     if fit_fn is not None:
@@ -728,7 +766,23 @@ def make_distribution(
     # ---- 6. params property ----
     @property
     def _params_prop(self):
-        return {pname: getattr(self, pname) for pname, _ in param_info}
+        d = {pname: getattr(self, pname) for pname, _ in param_info}
+        for _, ep_name, _ in _extra_param_info:
+            d[ep_name] = getattr(self, ep_name, None)
+        return d
+
+    # ---- 6b. __getitem__ override to preserve extra params through slicing ----
+    _getitem = None
+    if _extra_param_info:
+
+        def _getitem(self, key):
+            obj = self.__class__(self._params[:, key])
+            for _, ep_name, _ in _extra_param_info:
+                setattr(obj, ep_name, getattr(self, ep_name))
+            if scipy_dist_cls is not None and _scipy_map is not None:
+                sc_kw = {k: getattr(obj, v) for k, v in _scipy_map.items()}
+                obj.dist = scipy_dist_cls(**sc_kw)
+            return obj
 
     # ---- 7. __getattr__ for scipy delegation ----
     def _getattr(self, attr_name):
@@ -739,7 +793,7 @@ def make_distribution(
     # ---- 8. class_probs (classification) or mean() fallback (regression) ----
     _class_probs = None
     _mean = None
-    _extra_names = [str(e) for e in (extra_params or [])]
+    _extra_names = [ep_name for _, ep_name, _ in _extra_param_info]
 
     if is_classification:
 
@@ -755,7 +809,9 @@ def make_distribution(
             ]
             return np.column_stack(cols)
 
-    elif scipy_dist_cls is None:
+    if mean_fn is not None:
+        _mean = mean_fn
+    elif not is_classification and scipy_dist_cls is None:
 
         def _mean(self):
             return np.mean(self.sample(1000), axis=0)
@@ -773,6 +829,8 @@ def make_distribution(
         attrs["class_probs"] = _class_probs
     if _mean is not None:
         attrs["mean"] = _mean
+    if _getitem is not None:
+        attrs["__getitem__"] = _getitem
     if scipy_dist_cls is not None:
         attrs["__getattr__"] = _getattr
 

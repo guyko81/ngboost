@@ -15,31 +15,57 @@ Two factories are provided:
   `NGBRegressor(Dist=...)` or `NGBClassifier(Dist=...)`. This is the
   recommended entry point for both regression and classification.
 - `make_sympy_log_score` — creates just the **LogScore subclass** (for advanced
-  use when you need a custom `Distn` wrapper, e.g. extra non-optimized
-  parameters).
+  use when you need full control over the distribution wrapper).
 
 ## Built-in Distributions
 
 All SymPy-powered distributions are importable directly:
 
 ```python
-from ngboost.distns import Beta, BetaBernoulli, BetaBinomial, LogitNormal
+from ngboost.distns import Beta, BetaBernoulli, BetaBinomial, BetaBinomialEstN, LogitNormal
 ```
 
-| Distribution   | Type           | Factory used          | Use case                                  |
-|---------------|----------------|-----------------------|-------------------------------------------|
-| Beta          | Regression     | `make_distribution`   | Bounded (0,1) outcomes                    |
-| LogitNormal   | Regression     | `make_distribution`   | Bounded (0,1) with logistic-normal model  |
-| BetaBernoulli | Classification | `make_distribution`   | Binary with calibrated uncertainty         |
-| BetaBinomial  | Regression     | `make_sympy_log_score` + wrapper | Overdispersed count data          |
+| Distribution      | Type           | Factory used          | Use case                                  |
+|------------------|----------------|-----------------------|-------------------------------------------|
+| Beta             | Regression     | `make_distribution`   | Bounded (0,1) outcomes                    |
+| LogitNormal      | Regression     | `make_distribution`   | Bounded (0,1) with logistic-normal model  |
+| BetaBernoulli    | Classification | `make_distribution`   | Binary with calibrated uncertainty         |
+| BetaBinomial     | Regression     | `make_distribution`   | Overdispersed count data (known n)        |
+| BetaBinomialEstN | Regression     | `make_distribution`   | Overdispersed count data (unknown n)      |
 
-BetaBinomial uses `make_sympy_log_score` (the lower-level factory) because it
-requires a custom `Distn` wrapper for its extra non-optimized parameter `n` —
-see [Writing a custom wrapper](#writing-a-custom-distn-wrapper) below.
+## Quickstart: Using Built-in Distributions
 
-## Quickstart: One Function Call
+All SymPy-powered distributions work out of the box — just import and go:
 
 ### Regression
+
+```python
+from ngboost import NGBRegressor
+from ngboost.distns import Beta  # or LogitNormal, BetaBinomial, BetaBinomialEstN
+
+ngb = NGBRegressor(Dist=Beta)
+ngb.fit(X_train, Y_train)
+dists = ngb.pred_dist(X_test)      # full predictive distributions
+dists.ppf(0.1), dists.ppf(0.9)     # quantiles
+```
+
+### Classification
+
+```python
+from ngboost import NGBClassifier
+from ngboost.distns import BetaBernoulli
+
+ngb = NGBClassifier(Dist=BetaBernoulli)
+ngb.fit(X_train, Y_train)
+ngb.predict_proba(X_test)           # class probabilities with uncertainty
+```
+
+## Creating Custom Distributions with `make_distribution`
+
+To define your own distribution, provide SymPy symbols and either a
+`sympy.stats` distribution or a manual score expression:
+
+### From sympy.stats (auto-derives everything)
 
 ```python
 import sympy as sp
@@ -49,44 +75,33 @@ from ngboost.distns.sympy_utils import make_distribution
 
 alpha, beta, y = sp.symbols("alpha beta y", positive=True)
 
-Beta = make_distribution(
+MyBeta = make_distribution(
     params=[(alpha, True), (beta, True)],
     y=y,
     sympy_dist=symstats.Beta("Y", alpha, beta),
     scipy_dist_cls=scipy.stats.beta,
     scipy_kwarg_map={"a": alpha, "b": beta},
-    name="Beta",
+    name="MyBeta",
 )
-
-# Ready to use with NGBoost
-from ngboost import NGBRegressor
-ngb = NGBRegressor(Dist=Beta)
-ngb.fit(X_train, Y_train)
-ngb.predict(X_test)
 ```
 
-### Classification
+### Classification with class_prob_exprs
 
-For classification, pass `class_prob_exprs` — a list of SymPy expressions
-giving `[P(Y=0), P(Y=1), ...]`. The factory produces a `ClassificationDistn`
+Pass `class_prob_exprs` — a list of SymPy expressions giving
+`[P(Y=0), P(Y=1), ...]`. The factory produces a `ClassificationDistn`
 with `class_probs()` and categorical `sample()` auto-generated:
 
 ```python
 alpha, beta, y = sp.symbols("alpha beta y")
 p = alpha / (alpha + beta)
 
-BetaBernoulli = make_distribution(
+MyBetaBernoulli = make_distribution(
     params=[(alpha, True), (beta, True)],
     y=y,
     sympy_dist=symstats.Bernoulli("Y", p),
     class_prob_exprs=[1 - p, p],
-    name="BetaBernoulli",
+    name="MyBetaBernoulli",
 )
-
-from ngboost import NGBClassifier
-ngb = NGBClassifier(Dist=BetaBernoulli)
-ngb.fit(X_train, Y_train)
-ngb.predict_proba(X_test)
 ```
 
 The factory auto-derives score, gradients, and Fisher Information
@@ -136,18 +151,47 @@ Set `log_transformed=False` and derivatives are computed directly.
 ### Extra (non-optimized) parameters
 
 Parameters like `n` in BetaBinomial appear in the score but are not
-optimized by NGBoost. Pass them via `extra_params`:
+optimized by NGBoost. Pass them via `extra_params` with a default value:
+
+```python
+make_distribution(
+    params=[(alpha, True), (beta, True)],
+    y=y,
+    score_expr=score_expr,
+    extra_params=[(n, 1)],  # not differentiated, default value 1
+    fit_fn=my_fit,
+    name="BetaBinomial",
+)
+```
+
+The generated `__init__` accepts extra params as keyword arguments
+(`Dist(params, n=20)`) and the score class reads `self.n` automatically.
+Extra params are preserved through slicing (`dists[0:5]`).
+
+To use a specific `n`, subclass with the value baked in:
+
+```python
+from ngboost.distns import BetaBinomial
+
+class BetaBinomial20(BetaBinomial):
+    def __init__(self, params):
+        super().__init__(params, n=20)
+    def fit(Y):
+        return BetaBinomial.fit(Y, n=20)
+
+ngb = NGBRegressor(Dist=BetaBinomial20)
+```
+
+For the lower-level `make_sympy_log_score`, pass bare symbols instead:
 
 ```python
 make_sympy_log_score(
     params=[(alpha, True), (beta, True)],
     y=y,
     score_expr=score_expr,
-    extra_params=[n],  # not differentiated
+    extra_params=[n],  # bare symbol, no default
 )
 ```
-
-At runtime, the score class reads `self.n` from the distribution instance.
 
 ## Fisher Information Strategy
 
@@ -184,61 +228,6 @@ BetaBernoulliLogScore = make_sympy_log_score(
     y=y,
     sympy_dist=symstats.Bernoulli("Y", p),
 )
-```
-
-## Writing a Custom Distn Wrapper
-
-`make_distribution` produces complete distributions for both regression and
-classification. Use the lower-level `make_sympy_log_score` when you need:
-
-- **Extra parameters** (like `n` in BetaBinomial) that require custom
-  `__init__`, `fit`, and `sample`
-
-The factory generates the score/gradient/FI; you write the thin wrapper:
-
-### Extra-parameter wrapper (BetaBinomial)
-
-```python
-from ngboost.distns.distn import RegressionDistn
-from ngboost.distns.sympy_utils import make_sympy_log_score
-
-alpha, beta = sp.symbols("alpha beta", positive=True)
-y, n = sp.symbols("y n", positive=True, integer=True)
-
-BetaBinomialLogScore = make_sympy_log_score(
-    params=[(alpha, True), (beta, True)],
-    y=y,
-    score_expr=score,       # manual NLL expression
-    extra_params=[n],       # not optimized — read from self.n at runtime
-)
-
-class BetaBinomial(RegressionDistn):
-    n_params = 2
-    scores = [BetaBinomialLogScore]
-
-    def __init__(self, params, n=1):
-        super().__init__(params)
-        self.alpha = np.exp(np.clip(params[0], -150, 700))
-        self.beta = np.exp(np.clip(params[1], -150, 700))
-        self.n = n            # extra param — set here, read by score class
-
-    def fit(Y, n=1):  # initial params before boosting
-        ...
-
-    def sample(self, m):
-        ...
-```
-
-To use a specific `n`, subclass with the value baked in:
-
-```python
-class BetaBinomial20(BetaBinomial):
-    def __init__(self, params):
-        super().__init__(params, n=20)
-    def fit(Y):
-        return BetaBinomial.fit(Y, n=20)
-
-ngb = NGBRegressor(Dist=BetaBinomial20)
 ```
 
 ## Worked Examples
@@ -308,24 +297,48 @@ score = -(
     - sp.loggamma(alpha) - sp.loggamma(beta)
 )
 
-BetaBinomialLogScore = make_sympy_log_score(
+BetaBinomial = make_distribution(
     params=[(alpha, True), (beta, True)],
     y=y,
     score_expr=score,
-    extra_params=[n],
+    extra_params=[(n, 1)],    # fixed, not optimized
+    fit_fn=my_fit,
+    sample_fn=my_sample,
+    mean_fn=my_mean,
+    name="BetaBinomial",
 )
 ```
 
 FI path: Monte Carlo fallback (tier 3) — E[] over BetaBinomial produces
 unevaluated sums.
 
+### Estimated n (BetaBinomialEstN)
+
+When `n` is unknown, make it a third optimized parameter:
+
+```python
+BetaBinomialEstN = make_distribution(
+    params=[(alpha, True), (beta, True), (n, True)],  # n is optimized
+    y=y,
+    score_expr=score,
+    fit_fn=estn_fit,
+    sample_fn=estn_sample,
+    mean_fn=estn_mean,
+    name="BetaBinomialEstN",
+)
+```
+
+FI path: Monte Carlo fallback (tier 3). Note: estimating `n` from count
+data is harder than fixing it — prefer `BetaBinomial` when `n` is known.
+
 ## Testing
 
 ### Gradient correctness
 
 `tests/test_score.py` uses `scipy.optimize.approx_fprime` to compare
-`d_score()` against finite differences of `score()`. All four SymPy
-distributions (Beta, LogitNormal, BetaBernoulli, BetaBinomial) are included.
+`d_score()` against finite differences of `score()`. All SymPy
+distributions (Beta, LogitNormal, BetaBernoulli, BetaBinomial,
+BetaBinomialEstN) are included.
 
 ### Metric correctness
 
@@ -342,21 +355,37 @@ implementations numerically (score, d_score, and metric) — using only
 
 ## Example Notebooks
 
-| Notebook                          | Pattern demonstrated                          |
+### Built-in distributions (import and go)
+
+| Notebook                          | Distribution | Use case |
+|----------------------------------|-------------|----------|
+| `notebooks/example_beta.ipynb`           | `Beta` | Bounded (0,1) regression |
+| `notebooks/example_logitnormal.ipynb`    | `LogitNormal` | Bounded (0,1) with logistic-normal model |
+| `notebooks/example_betabernoulli.ipynb`  | `BetaBernoulli` | Binary classification with uncertainty |
+| `notebooks/example_betabinomial.ipynb`   | `BetaBinomial` | Overdispersed counts with fixed `n` (subclass pattern) |
+| `notebooks/example_betabinomial_estn.ipynb` | `BetaBinomialEstN` | Overdispersed counts with estimated `n` |
+| `notebooks/example_laplace.ipynb`        | `Laplace` | Robust regression with heavy tails |
+| `notebooks/example_t.ipynb`              | `T`, `TFixedDf`, `Cauchy` | Student's t with learnable or fixed degrees of freedom |
+| `notebooks/example_gamma.ipynb`          | `Gamma` | Positive continuous outcomes (income, duration) |
+| `notebooks/example_poisson.ipynb`        | `Poisson` | Count data (events per unit time) |
+| `notebooks/example_weibull.ipynb`        | `Weibull` | Survival and reliability analysis |
+| `notebooks/example_halfnormal.ipynb`     | `HalfNormal` | Positive outcomes with single scale parameter |
+| `notebooks/example_multivariate_normal.ipynb` | `MultivariateNormal(k)` | Multi-output regression with correlated predictions |
+
+### Factory demos and deep dives
+
+| Notebook                          | Pattern demonstrated |
 |----------------------------------|-----------------------------------------------|
 | `notebooks/example_normal.ipynb`         | `make_distribution` from scratch, verified against built-in Normal |
-| `notebooks/example_beta.ipynb`           | `make_distribution` with `sympy.stats` + scipy |
-| `notebooks/example_logitnormal.ipynb`    | `make_distribution` with manual `score_expr` + custom `sample_fn` |
-| `notebooks/example_betabernoulli.ipynb`  | `make_distribution` with `class_prob_exprs` for classification |
-| `notebooks/example_betabinomial.ipynb`   | `make_sympy_log_score` + extra params + custom `fit` |
 | `notebooks/example_mixture_lognormal.ipynb` | Advanced: 8-param mixture of 3 log-normals with logsumexp path |
 | `notebooks/sympy_normal_demo.ipynb`      | Deep dive: symbolic expressions, verification against hand-written code |
 
 ## Reference: SymPy-Powered Distributions
 
-| Distribution    | Params (link)                    | Score source   | FI method      |
-|----------------|----------------------------------|----------------|----------------|
-| Beta           | alpha (log), beta (log)          | auto from dist | y-free Hessian |
-| BetaBernoulli  | alpha (log), beta (log)          | auto from dist | SymPy E[]      |
-| BetaBinomial   | alpha (log), beta (log) + n      | manual         | Monte Carlo    |
-| LogitNormal    | mu (identity), sigma (log)       | manual         | Monte Carlo    |
+| Distribution      | Params (link)                         | Score source   | FI method      |
+|------------------|---------------------------------------|----------------|----------------|
+| Beta             | alpha (log), beta (log)               | auto from dist | y-free Hessian |
+| BetaBernoulli    | alpha (log), beta (log)               | auto from dist | SymPy E[]      |
+| BetaBinomial     | alpha (log), beta (log) + n (extra)   | manual         | Monte Carlo    |
+| BetaBinomialEstN | alpha (log), beta (log), n (log)      | manual         | Monte Carlo    |
+| LogitNormal      | mu (identity), sigma (log)            | manual         | Monte Carlo    |

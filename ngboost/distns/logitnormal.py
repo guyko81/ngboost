@@ -31,7 +31,10 @@ _score_expr = (
 def _sample_logitnormal(self, m):
     """Sample by transforming Normal samples through logistic."""
     mu, sigma = np.squeeze(self.mu), np.squeeze(self.sigma)
-    return 1.0 / (1.0 + np.exp(-np.random.normal(mu, sigma, size=m)))
+    return np.array([
+        1.0 / (1.0 + np.exp(-np.random.normal(mu, sigma)))
+        for _ in range(m)
+    ])
 
 
 LogitNormal = make_distribution(

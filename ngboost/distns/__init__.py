@@ -10,7 +10,7 @@ from .laplace import Laplace
 from .lognormal import LogNormal
 from .beta import Beta
 from .beta_bernoulli import BetaBernoulli
-from .betabinomial import BetaBinomial
+from .betabinomial import BetaBinomial, BetaBinomialEstN
 from .logitnormal import LogitNormal
 from .multivariate_normal import MultivariateNormal
 from .normal import Normal, NormalFixedMean, NormalFixedVar
@@ -22,6 +22,7 @@ __all__ = [
     "Beta",
     "BetaBernoulli",
     "BetaBinomial",
+    "BetaBinomialEstN",
     "Bernoulli",
     "k_categorical",
     "Cauchy",
