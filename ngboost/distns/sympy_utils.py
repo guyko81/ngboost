@@ -269,9 +269,18 @@ def make_sympy_log_score(
 
     _param_names = [str(p) for p, _ in params]
     _extra_names = [str(e) for e in extra_params]
+    _EXP_CLIP_VAL = np.exp(_EXP_CLIP)  # max value for log-transformed params
 
     def _get_param_arrays(self_obj):
-        param_arrays = [getattr(self_obj, n) for n in _param_names]
+        param_arrays = []
+        for name, (_, is_log) in zip(_param_names, params):
+            val = np.asarray(getattr(self_obj, name), dtype=float)
+            if is_log:
+                # Log-transformed params must be positive and finite.
+                # Clamp to [tiny, exp(700)] in case __init__ didn't clip
+                # the internal params before exp().
+                val = np.clip(val, np.finfo(float).tiny, _EXP_CLIP_VAL)
+            param_arrays.append(val)
         extra_arrays = [getattr(self_obj, n) for n in _extra_names]
         return param_arrays, extra_arrays
 
@@ -424,7 +433,12 @@ def make_sympy_log_score(
             FI = np.zeros((n, n_params, n_params))
             for i in range(n_params):
                 for j in range(n_params):
-                    FI[:, i, j] = fi_fns[i][j](*param_arrays, *extra_arrays)
+                    vals = fi_fns[i][j](*param_arrays, *extra_arrays)
+                    FI[:, i, j] = np.where(np.isfinite(vals), vals, 0.0)
+            # Tiny ridge ensures positive definiteness when overflow
+            # zeroed out entries that should be small but positive
+            # (e.g. alpha*beta/(alpha+beta)^2 → 0/0 when both huge).
+            FI[:, range(n_params), range(n_params)] += 1e-8
             return FI
 
     elif _lse_terms is not None:
