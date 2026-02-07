@@ -6,6 +6,7 @@ import pytest
 from scipy.optimize import approx_fprime
 
 from ngboost.distns import (
+    Beta,
     Cauchy,
     Distn,
     Gamma,
@@ -104,6 +105,7 @@ TEST_METRIC: List[DistScore] = [
     (Poisson, LogScore),
     (Gamma, LogScore),
     (Weibull, LogScore),
+    (Beta, LogScore),
 ] + [(MultivariateNormal(i), LogScore) for i in range(2, 5)]
 # Fill in the dist, score pair to test the gradient
 # Tests all in TEST_METRIC by default
