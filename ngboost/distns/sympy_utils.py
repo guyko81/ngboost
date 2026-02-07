@@ -5,7 +5,8 @@ Provides two factories:
 - ``make_sympy_log_score`` — creates a ``LogScore`` subclass from a SymPy
   distribution or symbolic expression (score, d_score, metric).
 - ``make_distribution`` — creates a complete NGBoost distribution class
-  (``RegressionDistn`` subclass) ready for ``NGBRegressor(Dist=...)``.
+  (``RegressionDistn`` or ``ClassificationDistn`` subclass) ready for
+  ``NGBRegressor(Dist=...)`` or ``NGBClassifier(Dist=...)``.
 """
 
 import numpy as np
@@ -488,14 +489,20 @@ def make_distribution(
     extra_params=None,
     fit_fn=None,
     sample_fn=None,
+    class_prob_exprs=None,
     name="SympyDistribution",
 ):
     """Create a complete NGBoost distribution from a SymPy definition.
 
     Combines ``make_sympy_log_score`` (for the score class) with an
-    auto-generated ``RegressionDistn`` subclass (for ``__init__``, ``fit``,
-    ``sample``, ``mean``, etc.), producing a class ready for
-    ``NGBRegressor(Dist=...)``.
+    auto-generated distribution subclass (for ``__init__``, ``fit``,
+    ``sample``, etc.), producing a class ready for
+    ``NGBRegressor(Dist=...)`` or ``NGBClassifier(Dist=...)``.
+
+    When ``class_prob_exprs`` is provided the result is a
+    ``ClassificationDistn`` subclass with an auto-generated
+    ``class_probs()`` method.  Otherwise the result is a
+    ``RegressionDistn`` subclass with ``mean()``.
 
     Parameters
     ----------
@@ -512,6 +519,7 @@ def make_distribution(
     scipy_dist_cls : scipy.stats distribution class or None
         E.g. ``scipy.stats.beta``.  Enables auto-generated ``fit``,
         ``sample``, and ``mean`` (via ``__getattr__`` delegation).
+        Mutually exclusive with ``class_prob_exprs``.
     scipy_kwarg_map : dict[str, sympy.Symbol] or None
         Maps scipy keyword argument names to sympy parameter symbols.
         E.g. ``{"a": alpha, "b": beta}`` for ``scipy.stats.beta(a=, b=)``.
@@ -522,16 +530,23 @@ def make_distribution(
         ``fit(Y) -> np.array([internal_param_0, internal_param_1, ...])``.
     sample_fn : callable or None
         Custom ``sample(self, m) -> np.ndarray`` override.
+    class_prob_exprs : list[sympy.Expr] or None
+        SymPy expressions for class probabilities ``[P(Y=0), P(Y=1), ...]``.
+        When provided, the result is a ``ClassificationDistn`` subclass
+        with ``class_probs()`` and categorical ``sample()`` auto-generated.
     name : str
         Class name for the generated distribution.
 
     Returns
     -------
     type
-        A ``RegressionDistn`` subclass ready for NGBoost.
+        A ``RegressionDistn`` or ``ClassificationDistn`` subclass ready
+        for NGBoost.
 
     Examples
     --------
+    Regression (Beta distribution):
+
     >>> import sympy as sp, sympy.stats as symstats, scipy.stats
     >>> alpha, beta, y = sp.symbols("alpha beta y", positive=True)
     >>> Beta = make_distribution(
@@ -544,8 +559,34 @@ def make_distribution(
     ... )
     >>> from ngboost import NGBRegressor
     >>> ngb = NGBRegressor(Dist=Beta)
+
+    Classification (Beta-Bernoulli):
+
+    >>> p = alpha / (alpha + beta)
+    >>> BetaBernoulli = make_distribution(
+    ...     params=[(alpha, True), (beta, True)],
+    ...     y=y,
+    ...     sympy_dist=symstats.Bernoulli("Y", p),
+    ...     class_prob_exprs=[1 - p, p],
+    ...     name="BetaBernoulli",
+    ... )
+    >>> from ngboost import NGBClassifier
+    >>> ngb = NGBClassifier(Dist=BetaBernoulli)
     """
-    from ngboost.distns.distn import RegressionDistn
+    from ngboost.distns.distn import ClassificationDistn, RegressionDistn
+
+    is_classification = class_prob_exprs is not None
+
+    if is_classification and scipy_dist_cls is not None:
+        raise ValueError(
+            "class_prob_exprs and scipy_dist_cls are mutually exclusive."
+        )
+    if is_classification and len(class_prob_exprs) < 2:
+        raise ValueError(
+            "class_prob_exprs must contain at least 2 expressions (one per class)."
+        )
+
+    _base_cls = ClassificationDistn if is_classification else RegressionDistn
 
     # ---- 1. Create the LogScore subclass ----
     score_cls = make_sympy_log_score(
@@ -566,9 +607,21 @@ def make_distribution(
     if scipy_kwarg_map is not None:
         _scipy_map = {k: str(v) for k, v in scipy_kwarg_map.items()}
 
+    # ---- 2b. Lambdify class probability expressions (classification) ----
+    _class_prob_fns = None
+    _n_classes = None
+    if is_classification:
+        _n_classes = len(class_prob_exprs)
+        param_symbols = [s for s, _ in params]
+        _extra_syms = extra_params if extra_params else None
+        _class_prob_fns = [
+            _build_lambdified(expr, param_symbols, _extra_syms)
+            for expr in class_prob_exprs
+        ]
+
     # ---- 3. __init__ ----
     def _init(self, internal_params):
-        RegressionDistn.__init__(self, internal_params)
+        _base_cls.__init__(self, internal_params)
         for i, (pname, is_log) in enumerate(param_info):
             if is_log:
                 val = np.exp(np.clip(internal_params[i], -150, _EXP_CLIP))
@@ -652,6 +705,19 @@ def make_distribution(
         def _sample(self, m):
             return np.array([self.dist.rvs() for _ in range(m)])
 
+    elif is_classification:
+
+        def _sample(self, m):
+            probs = self.class_probs()  # (n_samples, K)
+            p = np.squeeze(probs)
+            if p.ndim == 1:
+                return np.random.choice(_n_classes, size=m, p=p).astype(float)
+            # Multi-instance: sample one label per instance, m times
+            return np.array([
+                [np.random.choice(_n_classes, p=p[i]) for i in range(len(p))]
+                for _ in range(m)
+            ]).astype(float)
+
     else:
 
         def _sample(self, m):
@@ -670,16 +736,29 @@ def make_distribution(
             return getattr(self.__dict__["dist"], attr_name)
         return None
 
-    # ---- 8. mean() fallback ----
-    # When scipy_dist_cls is available, mean() is delegated via __getattr__.
-    # Otherwise, approximate with sampling.
-    if scipy_dist_cls is None:
+    # ---- 8. class_probs (classification) or mean() fallback (regression) ----
+    _class_probs = None
+    _mean = None
+    _extra_names = [str(e) for e in (extra_params or [])]
+
+    if is_classification:
+
+        def _class_probs(self):
+            param_arrays = [
+                np.asarray(getattr(self, pname), dtype=float)
+                for pname, _ in param_info
+            ]
+            extra_arrays = [getattr(self, n) for n in _extra_names]
+            cols = [
+                np.asarray(fn(*param_arrays, *extra_arrays), dtype=float)
+                for fn in _class_prob_fns
+            ]
+            return np.column_stack(cols)
+
+    elif scipy_dist_cls is None:
 
         def _mean(self):
             return np.mean(self.sample(1000), axis=0)
-
-    else:
-        _mean = None
 
     # ---- 9. Build the class ----
     attrs = {
@@ -690,9 +769,11 @@ def make_distribution(
         "sample": _sample,
         "params": _params_prop,
     }
+    if _class_probs is not None:
+        attrs["class_probs"] = _class_probs
     if _mean is not None:
         attrs["mean"] = _mean
     if scipy_dist_cls is not None:
         attrs["__getattr__"] = _getattr
 
-    return type(name, (RegressionDistn,), attrs)
+    return type(name, (_base_cls,), attrs)

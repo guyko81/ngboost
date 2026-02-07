@@ -12,9 +12,10 @@ tedious and error-prone. Each distribution requires:
 Two factories are provided:
 
 - `make_distribution` — creates a **complete distribution class** ready for
-  `NGBRegressor(Dist=...)`. This is the recommended entry point.
+  `NGBRegressor(Dist=...)` or `NGBClassifier(Dist=...)`. This is the
+  recommended entry point for both regression and classification.
 - `make_sympy_log_score` — creates just the **LogScore subclass** (for advanced
-  use when you need a custom `Distn` wrapper, e.g. classification or extra
+  use when you need a custom `Distn` wrapper, e.g. extra non-optimized
   parameters).
 
 ## Built-in Distributions
@@ -29,14 +30,16 @@ from ngboost.distns import Beta, BetaBernoulli, BetaBinomial, LogitNormal
 |---------------|----------------|-----------------------|-------------------------------------------|
 | Beta          | Regression     | `make_distribution`   | Bounded (0,1) outcomes                    |
 | LogitNormal   | Regression     | `make_distribution`   | Bounded (0,1) with logistic-normal model  |
-| BetaBernoulli | Classification | `make_sympy_log_score` + wrapper | Binary with calibrated uncertainty |
+| BetaBernoulli | Classification | `make_distribution`   | Binary with calibrated uncertainty         |
 | BetaBinomial  | Regression     | `make_sympy_log_score` + wrapper | Overdispersed count data          |
 
-BetaBernoulli and BetaBinomial use `make_sympy_log_score` (the lower-level
-factory) because they require custom `Distn` wrappers — see
-[Writing a custom wrapper](#writing-a-custom-distn-wrapper) below.
+BetaBinomial uses `make_sympy_log_score` (the lower-level factory) because it
+requires a custom `Distn` wrapper for its extra non-optimized parameter `n` —
+see [Writing a custom wrapper](#writing-a-custom-distn-wrapper) below.
 
 ## Quickstart: One Function Call
+
+### Regression
 
 ```python
 import sympy as sp
@@ -62,8 +65,33 @@ ngb.fit(X_train, Y_train)
 ngb.predict(X_test)
 ```
 
-That's it. The factory auto-derives score, gradients, and Fisher Information
-from the SymPy distribution, and auto-generates fit/sample/mean from scipy.
+### Classification
+
+For classification, pass `class_prob_exprs` — a list of SymPy expressions
+giving `[P(Y=0), P(Y=1), ...]`. The factory produces a `ClassificationDistn`
+with `class_probs()` and categorical `sample()` auto-generated:
+
+```python
+alpha, beta, y = sp.symbols("alpha beta y")
+p = alpha / (alpha + beta)
+
+BetaBernoulli = make_distribution(
+    params=[(alpha, True), (beta, True)],
+    y=y,
+    sympy_dist=symstats.Bernoulli("Y", p),
+    class_prob_exprs=[1 - p, p],
+    name="BetaBernoulli",
+)
+
+from ngboost import NGBClassifier
+ngb = NGBClassifier(Dist=BetaBernoulli)
+ngb.fit(X_train, Y_train)
+ngb.predict_proba(X_test)
+```
+
+The factory auto-derives score, gradients, and Fisher Information
+from the SymPy distribution, and auto-generates fit/sample/mean (regression)
+or class_probs/sample (classification).
 
 ## When You Need a Manual Score Expression
 
@@ -160,49 +188,13 @@ BetaBernoulliLogScore = make_sympy_log_score(
 
 ## Writing a Custom Distn Wrapper
 
-`make_distribution` produces a complete `RegressionDistn`. Use the lower-level
-`make_sympy_log_score` when you need:
+`make_distribution` produces complete distributions for both regression and
+classification. Use the lower-level `make_sympy_log_score` when you need:
 
-- **Classification** (`ClassificationDistn` with `class_probs()`)
 - **Extra parameters** (like `n` in BetaBinomial) that require custom
   `__init__`, `fit`, and `sample`
 
 The factory generates the score/gradient/FI; you write the thin wrapper:
-
-### Classification wrapper (BetaBernoulli)
-
-```python
-from ngboost.distns.distn import ClassificationDistn
-from ngboost.distns.sympy_utils import make_sympy_log_score
-
-alpha, beta, y = sp.symbols("alpha beta y")
-p = alpha / (alpha + beta)
-
-BetaBernoulliLogScore = make_sympy_log_score(
-    params=[(alpha, True), (beta, True)],
-    y=y,
-    sympy_dist=symstats.Bernoulli("Y", p),
-)
-
-class BetaBernoulli(ClassificationDistn):
-    n_params = 2
-    scores = [BetaBernoulliLogScore]
-
-    def __init__(self, params):
-        super().__init__(params)
-        self.alpha = np.exp(np.clip(params[0], -150, 700))
-        self.beta = np.exp(np.clip(params[1], -150, 700))
-
-    def class_probs(self):
-        p = self.alpha / (self.alpha + self.beta)
-        return np.column_stack([1 - p, p])
-
-    def fit(Y):  # initial params before boosting
-        ...
-
-    def sample(self, m):
-        ...
-```
 
 ### Extra-parameter wrapper (BetaBinomial)
 
@@ -291,10 +283,12 @@ FI path: Monte Carlo fallback (tier 3) — no `sympy_dist` available.
 alpha, beta, y = sp.symbols("alpha beta y")
 p = alpha / (alpha + beta)
 
-BetaBernoulliLogScore = make_sympy_log_score(
+BetaBernoulli = make_distribution(
     params=[(alpha, True), (beta, True)],
     y=y,
     sympy_dist=symstats.Bernoulli("Y", p),
+    class_prob_exprs=[1 - p, p],
+    name="BetaBernoulli",
 )
 ```
 
@@ -353,7 +347,7 @@ implementations numerically (score, d_score, and metric) — using only
 | `notebooks/example_normal.ipynb`         | `make_distribution` from scratch, verified against built-in Normal |
 | `notebooks/example_beta.ipynb`           | `make_distribution` with `sympy.stats` + scipy |
 | `notebooks/example_logitnormal.ipynb`    | `make_distribution` with manual `score_expr` + custom `sample_fn` |
-| `notebooks/example_betabernoulli.ipynb`  | `make_sympy_log_score` + `ClassificationDistn` wrapper |
+| `notebooks/example_betabernoulli.ipynb`  | `make_distribution` with `class_prob_exprs` for classification |
 | `notebooks/example_betabinomial.ipynb`   | `make_sympy_log_score` + extra params + custom `fit` |
 | `notebooks/example_mixture_lognormal.ipynb` | Advanced: 8-param mixture of 3 log-normals with logsumexp path |
 | `notebooks/sympy_normal_demo.ipynb`      | Deep dive: symbolic expressions, verification against hand-written code |
